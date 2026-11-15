@@ -1,0 +1,285 @@
+"""Configuration: one TOML file, defaults embedded here as the single source of truth.
+
+`dewey init ROOT` writes DEFAULT_TOML to ROOT/.dewey/dewey.toml for editing.
+User values override defaults key-by-key; [[rules]] and [categories] replace
+the defaults wholesale when present (merging rule lists is more confusing than useful).
+"""
+from __future__ import annotations
+
+import copy
+import os
+import tomllib
+from pathlib import Path
+
+STATE_DIRNAME = ".dewey"
+
+DEFAULT_TOML = r'''
+# dewey configuration ------------------------------------------------------
+# Anything you delete falls back to the built-in default.
+# If you define [[rules]] or [categories] here, yours REPLACE the defaults.
+
+[scan]
+hash = "sha256"          # "sha256" (stdlib) or "blake3" (pip install blake3; several times faster)
+workers = 4              # parallel hashing/extraction threads
+hash_cloud_files = false # iCloud "Optimize Mac Storage" placeholders: reading them downloads them.
+                         # false = catalog them but don't read, hash or move them.
+snippet_chars = 400      # text preview sent to the decider. Laya's context is 512 tokens and the
+                         # folder descriptions share it, so keep this short.
+skip_dirs = [".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".Trash",
+             ".Trashes", ".Spotlight-V100", ".fseventsd", ".TemporaryItems",
+             ".DocumentRevisions-V100", ".cache"]
+ignore_files = [".DS_Store", "Icon\r", ".localized", "desktop.ini", "Thumbs.db", ".com.apple.timemachine.donotpresent"]
+# Directories ending in these are macOS packages/bundles: cataloged as ONE unit, never opened or split.
+# Any folder holding Contents/Info.plist or Contents/PkgInfo is treated as a bundle too, listed or not.
+bundle_suffixes = [".app", ".photoslibrary", ".photolibrary", ".migratedphotolibrary", ".aplibrary",
+                   ".fcpbundle", ".fcpxmld", ".logicx", ".band", ".xcodeproj", ".xcworkspace",
+                   ".xcarchive", ".playground", ".dSYM", ".bundle", ".framework", ".plugin", ".kext",
+                   ".appex", ".prefPane", ".qlgenerator", ".mdimporter", ".saver", ".workflow", ".scptd",
+                   ".lrdata", ".lrcat-data", ".lrlibrary", ".rtfd", ".textbundle", ".pages", ".numbers",
+                   ".key", ".graffle", ".dtBase2", ".sparsebundle", ".musiclibrary", ".tvlibrary",
+                   ".imovielibrary", ".scriv", ".pkg", ".mpkg", ".pvm", ".vmwarevm", ".utm"]
+# A folder containing any of these is a project: cataloged as one unit and left in place.
+# Not just repos: a GitHub "Download ZIP" has no .git, so build files count too.
+project_markers = [".git", ".hg", ".svn", "package.json", "pyproject.toml", "setup.py", "Cargo.toml",
+                   "go.mod", "Gemfile", "pom.xml", "build.gradle", "composer.json", "CMakeLists.txt",
+                   "Makefile"]
+
+[plan]
+dest = ""                 # "" = reorganize inside the scanned folder; or an absolute path elsewhere
+review_dir = "_Review"    # duplicates / junk / empties land here. Nothing is ever deleted.
+keep_duplicate = "oldest" # which copy stays put: "oldest" | "newest" | "shortest_path"
+auto_confidence = 0.85    # decider answers at/above this -> status "auto"
+review_confidence = 0.50  # between this and auto -> "review"; below -> left in place, listed as unsure
+max_depth = 0             # 0 = only loose files in the top folder move; every subfolder stays whole
+                          # (nothing is pulled out of it, not even duplicates). N = files up to N
+                          # folders deep may move. -1 = file everything individually (splits folders).
+
+[folders]
+# Folders that stay whole get a kind in the report (from what's inside them), and ONE review row
+# that moves the whole folder, contents untouched, on the same disk. Approve it in the CSV like any
+# review row, or change its category to another kind or folder key. move = false: label only.
+move = true
+# kind = where a folder of that kind goes ("" = label it, leave it where it is)
+code = "Code"            # project markers, Xcode projects, .github, mostly source, GitHub "-main" ZIPs
+cad = "3D & CAD"         # .scad/.step/.f3d sources, or mostly .stl/.3mf
+design = "Design"        # design sources (.fig/.psd/.sketch), or images with specs/README (handoffs)
+images = "Images"        # icon sets, folders of downloaded pictures
+photos = "Photos"        # mostly camera photos (EXIF)
+documents = "Documents"  # mostly PDFs, Office files, text
+video = "Videos"
+audio = "Audio"
+mixed = ""               # no clear kind: labelled, left where it is
+
+[decider]
+backend = "systemone"     # "systemone": Laya or any Jev-compatible server (POST /v1/systemone)
+                          # "chat": any OpenAI-compatible server (mlx_lm.server, oMLX, Ollama, LM Studio)
+                          # "none": rules only
+url = "http://127.0.0.1:8000"
+model = "english"         # laya-serve checkpoint name; for chat e.g. "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+question = "Which folder should this file be filed in?"
+timeout = 30
+workers = 4               # concurrent requests to the decider
+trust_chat_confidence = false   # chat LLMs self-report confidence (uncalibrated). When false, chat
+                                # answers are capped just below auto_confidence so a human reviews them.
+
+# Rules run first, top to bottom, first match wins. Anything no rule claims goes to the decider.
+# Match keys (all optional; every key given must match):
+#   ext = [".pdf"], name_regex = "...", path_regex = "...", min_size / max_size (bytes), has_camera = true
+# target/reason placeholders: {review} {year} {month} {camera}
+#   {year}/{month} come from photo EXIF when available, else the file's modified date.
+
+[[rules]]
+name = "empty"
+max_size = 0
+target = "{review}/Empty"
+reason = "Zero-byte file"
+
+[[rules]]
+name = "partial-download"
+ext = [".crdownload", ".part", ".partial", ".download", ".tmp", ".temp"]
+target = "{review}/Junk"
+reason = "Incomplete download or temp file"
+
+[[rules]]
+name = "office-lockfile"
+name_regex = '^(~\$|\.~lock\.)'
+target = "{review}/Junk"
+reason = "Office lock/owner file left behind"
+
+[[rules]]
+name = "screenshot"
+name_regex = '^(Screenshot|Screen Shot|Screen Recording|CleanShot) '
+target = "Screenshots/{year}"
+reason = "macOS screenshot naming"
+
+[[rules]]
+name = "camera-photo"
+has_camera = true
+target = "Photos/{year}"
+reason = "EXIF says it came from a camera ({camera})"
+
+[[rules]]
+name = "phone-raw-photo"
+ext = [".heic", ".heif", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2"]
+target = "Photos/{year}"
+reason = "Phone/camera photo format"
+
+[[rules]]
+name = "video"
+ext = [".mov", ".mp4", ".m4v", ".avi", ".mkv", ".mts", ".webm"]
+target = "Videos/{year}"
+reason = "Video file"
+
+[[rules]]
+name = "audio"
+ext = [".mp3", ".m4a", ".wav", ".aiff", ".aif", ".flac", ".ogg", ".opus", ".aac"]
+target = "Audio"
+reason = "Audio file"
+
+[[rules]]
+name = "installer"
+ext = [".dmg", ".pkg", ".mpkg", ".exe", ".msi", ".iso", ".appimage", ".deb", ".rpm", ".apk", ".ipsw"]
+target = "Installers"
+reason = "Installer / disk image (usually re-downloadable)"
+
+[[rules]]
+name = "3d-cad"
+ext = [".stl", ".3mf", ".step", ".stp", ".obj", ".f3d", ".f3z", ".gcode", ".bgcode", ".scad", ".iges", ".igs", ".skp", ".dxf"]
+target = "3D & CAD"
+reason = "3D model / CAD / slicer file"
+
+[[rules]]
+name = "fonts"
+ext = [".ttf", ".otf", ".woff", ".woff2"]
+target = "Fonts"
+reason = "Font file"
+
+[[rules]]
+name = "archives"
+ext = [".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".bz2", ".xz", ".zst"]
+target = "Archives"
+reason = "Compressed archive"
+
+# The decider picks exactly ONE of these for each file no rule claimed.
+# Keys are the answers it gives (keep them stable once you start collecting labels).
+# Descriptions are what the model reads: short and concrete beats long and clever.
+# path = "" means "leave it where it is".
+
+[categories.finance]
+path = "Documents/Finance"
+desc = "bank or card statements, invoices, receipts, bills, tax forms, pay stubs, budgets"
+
+[categories.medical]
+path = "Documents/Medical"
+desc = "medical records, health insurance, prescriptions, lab results, EOBs"
+
+[categories.home]
+path = "Documents/Home"
+desc = "mortgage, deed, home insurance, utilities, warranties, contractor quotes, property tax"
+
+[categories.vehicles]
+path = "Documents/Vehicles"
+desc = "vehicle registration, title, service records, auto insurance"
+
+[categories.manuals]
+path = "Documents/Manuals"
+desc = "product manuals, user guides, datasheets, spec sheets, install instructions"
+
+[categories.work]
+path = "Documents/Work"
+desc = "job documents: reports, policies, meeting notes, proposals, presentations"
+
+[categories.personal]
+path = "Documents/Personal"
+desc = "letters, certificates, school records, resumes, legal papers"
+
+[categories.reference]
+path = "Documents/Reference"
+desc = "articles, papers, ebooks, how-to guides saved for reading"
+
+[categories.data]
+path = "Data"
+desc = "raw data: CSV/JSON/XML exports, databases, logs, datasets"
+
+[categories.code]
+path = "Code"
+desc = "source code, scripts, config files, notebooks"
+
+[categories.images]
+path = "Images"
+desc = "graphics, logos, icons, diagrams, downloaded pictures (not personal photos)"
+
+[categories.design]
+path = "Design"
+desc = "design source files and mockups: SVG, PSD, layouts"
+
+[categories.notes]
+path = "Notes"
+desc = "personal notes, drafts, to-do lists, brainstorms"
+
+[categories.other]
+path = ""
+desc = "none of the above / not sure"
+'''
+
+DEFAULTS: dict = tomllib.loads(DEFAULT_TOML)
+REPLACE_WHOLESALE = {"rules", "categories"}
+
+
+def _merge(base: dict, over: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        if k in REPLACE_WHOLESALE:
+            out[k] = copy.deepcopy(v)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def state_dir_for(root: Path, override: str | None = None) -> Path:
+    return Path(override).expanduser().resolve() if override else root / STATE_DIRNAME
+
+
+def find_config(state_dir: Path, explicit: str | None) -> Path | None:
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"config not found: {p}")
+        return p
+    for p in (state_dir / "dewey.toml",
+              Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dewey" / "dewey.toml"):
+        if p.is_file():
+            return p
+    return None
+
+
+def load(state_dir: Path, explicit: str | None = None) -> tuple[dict, Path | None]:
+    path = find_config(state_dir, explicit)
+    if path is None:
+        return copy.deepcopy(DEFAULTS), None
+    with open(path, "rb") as fh:
+        user = tomllib.load(fh)
+    cfg = _merge(DEFAULTS, user)
+    validate(cfg)
+    return cfg, path
+
+
+def validate(cfg: dict) -> None:
+    cats = cfg.get("categories") or {}
+    if cfg["decider"]["backend"] != "none" and len(cats) < 2:
+        raise SystemExit("config: [categories] needs at least 2 entries for the decider")
+    if len(cats) > 255:
+        raise SystemExit("config: decision models cap a choice at 255 options; split into two stages")
+    for key, c in cats.items():
+        if "path" not in c or "desc" not in c:
+            raise SystemExit(f"config: categories.{key} needs both path and desc")
+    for r in cfg.get("rules", []):
+        if "name" not in r or "target" not in r:
+            raise SystemExit(f"config: every [[rules]] entry needs name and target: {r}")
+    p = cfg["plan"]
+    if not (0 <= p["review_confidence"] <= p["auto_confidence"] <= 1):
+        raise SystemExit("config: need 0 <= review_confidence <= auto_confidence <= 1")
+    if p["keep_duplicate"] not in ("oldest", "newest", "shortest_path"):
+        raise SystemExit("config: plan.keep_duplicate must be oldest | newest | shortest_path")

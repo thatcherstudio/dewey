@@ -2,13 +2,15 @@ import AppKit
 import DeweyCore
 import Observation
 
-/// One folder in the sidebar: what `dewey status` says about it, its Scan & Plan run, and the
-/// review of its latest plan.
+/// One folder in the sidebar: what `dewey status` says about it, its Scan & Plan run, the review of
+/// its latest plan, and moving files (Apply) and putting them back (History).
 @MainActor @Observable
 final class FolderModel {
     enum Tab: String, CaseIterable, Identifiable {
         case overview = "Overview"
         case review = "Review"
+        case apply = "Apply"
+        case history = "History"
         var id: String { rawValue }
     }
 
@@ -21,6 +23,12 @@ final class FolderModel {
     var session: ScanPlanSession?
     /// Made the first time the Review tab opens; kept so unsaved changes survive switching tabs.
     var review: PlanReview?
+    /// The Apply tab's options and preview, made the first time it opens.
+    var apply: ApplyPlan?
+    /// Files moving, or moved: kept until "Done", like `session`.
+    var moveRun: CommandRun<ApplyResult>?
+    /// Files going back (History's Undo).
+    var undoRun: CommandRun<UndoResult>?
     @ObservationIgnored private weak var app: AppModel?
 
     init(path: String, app: AppModel) {
@@ -32,7 +40,18 @@ final class FolderModel {
     var name: String { url.lastPathComponent.isEmpty ? path : url.lastPathComponent }
     var displayPath: String { (path as NSString).abbreviatingWithTildeInPath }
     var parentPath: String { ((path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath }
-    var isRunning: Bool { session?.isActive ?? false }
+    /// dewey is working on this folder (scan, plan, move or undo): one thing at a time.
+    var isRunning: Bool {
+        (session?.isActive ?? false) || (moveRun?.isActive ?? false) || (undoRun?.isActive ?? false)
+    }
+    /// A run screen is showing (running or ended, until "Done"): the tabs wait for it.
+    var showsRun: Bool { session != nil || moveRun != nil || undoRun != nil }
+    /// What's running, for the quit alert.
+    var activity: String {
+        if undoRun?.isActive == true { return "putting files back" }
+        if moveRun?.isActive == true { return "moving files" }
+        return "Scan & Plan"
+    }
     var hasUnsavedChanges: Bool { review?.hasChanges ?? false }
 
     /// Still there (an external disk may be unplugged, a folder renamed in Finder).
@@ -94,6 +113,59 @@ final class FolderModel {
         guard !isRunning else { return }
         session = nil
         tab = .review
+    }
+
+    func makeApply() {
+        guard apply == nil, let cli = app?.cli else { return }
+        apply = ApplyPlan(cli: cli, root: path)
+    }
+
+    /// Move the files the Apply preview lists. Refused while Review has unsaved changes: apply reads
+    /// plan-N.csv, so it would move what the file says, not what the table shows.
+    func startMove() {
+        guard let cli = app?.cli, !isRunning, !hasUnsavedChanges, let args = apply?.moveArguments() else { return }
+        let run = CommandRun<ApplyResult>(cli: cli, arguments: args, phases: ["move"])
+        run.onEnd = { [weak self] _ in self?.filesMoved() }
+        moveRun = run
+        run.start()
+    }
+
+    /// Put back the files of one batch.
+    func undo(batch: String) {
+        guard let cli = app?.cli, !isRunning else { return }
+        moveRun = nil
+        let run = CommandRun<UndoResult>(cli: cli, arguments: ["undo", path, "--batch", batch], phases: ["undo"])
+        run.onEnd = { [weak self] _ in self?.filesMoved() }
+        undoRun = run
+        run.start()
+    }
+
+    /// After a move or undo: the catalog, the batches and the preview changed.
+    private func filesMoved() {
+        Task {
+            await refresh()
+            if apply != nil { await apply?.refresh() }
+        }
+        if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
+    }
+
+    /// Close the move or undo screen, onto History (where the batch now is).
+    func dismissMoves() {
+        guard !isRunning else { return }
+        moveRun = nil
+        undoRun = nil
+        tab = .history
+    }
+
+    /// The journal of a batch: the readable summary when the batch finished, else the raw log.
+    func journal(_ batch: String) -> URL? {
+        guard let state = status?.state else { return nil }
+        let dir = URL(fileURLWithPath: state).appending(path: "moves")
+        for name in ["\(batch).json", "\(batch).jsonl"] {
+            let url = dir.appending(path: name)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
     }
 
     func makeReview() {

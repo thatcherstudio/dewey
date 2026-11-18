@@ -35,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await model.launch() }
     }
 
-    /// A scan in progress is safe to stop (it keeps what's done), but say so before quitting.
+    /// A scan or move in progress is safe to stop (it keeps what's done, moves stay undoable), but say so
+    /// before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let unsaved = model.foldersWithUnsavedChanges
         if !unsaved.isEmpty {
@@ -54,9 +55,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !busy.isEmpty else { return .terminateNow }
         let alert = NSAlert()
         alert.messageText = busy.count == 1
-            ? "Stop Scan & Plan of \(busy[0].name) and quit?"
-            : "Stop Scan & Plan of \(busy.count) folders and quit?"
-        alert.informativeText = "Everything finished so far is saved, so the next Scan & Plan picks up from there."
+            ? "Stop \(busy[0].activity) in \(busy[0].name) and quit?"
+            : "Stop dewey in \(busy.count) folders and quit?"
+        alert.informativeText = busy.contains { $0.moveRun?.isActive == true || $0.undoRun?.isActive == true }
+            ? "Dewey stops after the file in hand. Files already moved stay where they are now, and History can put "
+                + "them back."
+            : "Everything finished so far is saved, so the next Scan & Plan picks up from there."
         alert.addButton(withTitle: "Stop and Quit")
         alert.addButton(withTitle: "Keep Running")
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel

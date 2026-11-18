@@ -188,7 +188,8 @@ struct PhaseRow: View {
     }
 
     static let caption = ["walk": "finding every file", "hash": "reading and fingerprinting",
-                          "decide": "asking the model where files go"]
+                          "decide": "asking the model where files go", "move": "into their new folders",
+                          "undo": "back where they were"]
 
     private var isIdle: Bool {
         switch phase.state {
@@ -287,7 +288,7 @@ struct PlanOutcome: View {
     }
 }
 
-private struct Stat: View {
+struct Stat: View {
     let n: Int
     let label: String
     let tint: Color

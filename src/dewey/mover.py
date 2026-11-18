@@ -401,7 +401,7 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
                "started": started, "finished": now_iso(),
                "counts": {"moved": len(moved), "skipped": len(skipped), "failed": len(failed),
                           "bytes_moved": sum(m["size"] for m in moved), "pruned_dirs": len(pruned)},
-               "moved": [{k: m[k] for k in ("from", "to", "reason", "category", "decided_by", "confidence",
+               "moved": [{k: m[k] for k in ("from", "to", "kind", "reason", "category", "decided_by", "confidence",
                                             "status", "hash", "size", "method", "at")} for m in moved],
                "skipped": skipped, "failed": failed, "pruned_dirs": pruned,
                "undo": f"dewey undo '{root}' --batch {batch}"}

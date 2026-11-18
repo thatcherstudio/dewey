@@ -106,6 +106,14 @@ public enum ProgressText {
 
     public static func count(_ n: Int) -> String { n.formatted() }
 
+    /// "1 file", "4 files and 2 folders", "2 folders".
+    public static func items(files: Int, folders: Int) -> String {
+        let f = "\(count(files)) \(files == 1 ? "file" : "files")"
+        guard folders > 0 else { return f }
+        let d = "\(count(folders)) \(folders == 1 ? "folder" : "folders")"
+        return files > 0 ? "\(f) and \(d)" : d
+    }
+
     static func rate(_ r: Double) -> String {
         r >= 100 ? Int(r.rounded()).formatted() : r.formatted(.number.precision(.fractionLength(1)))
     }

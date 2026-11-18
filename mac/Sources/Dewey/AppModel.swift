@@ -158,7 +158,7 @@ final class AppModel {
         return f
     }
 
-    /// Folders with a scan or plan running.
+    /// Folders with dewey running (scan, plan, move or undo).
     var busyFolders: [FolderModel] {
         folders.paths.compactMap { folderModels[$0] }.filter(\.isRunning)
     }
@@ -201,7 +201,11 @@ final class AppModel {
 
     /// App quit: SIGINT every running dewey, like Ctrl-C (it saves what's done and exits on its own).
     func cancelAllRuns() {
-        for f in busyFolders { f.session?.cancel() }
+        for f in busyFolders {
+            f.session?.cancel()
+            f.moveRun?.cancel()
+            f.undoRun?.cancel()
+        }
     }
 
     /// Pick an executable with an open panel and remember it in Settings.

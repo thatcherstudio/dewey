@@ -159,7 +159,7 @@ struct NoFolderView: View {
     }
 }
 
-/// One folder: its Scan & Plan run while there is one, otherwise the Overview or Review tab.
+/// One folder: a run screen while there is one (Scan & Plan, Move, Undo), otherwise its tabs.
 struct FolderDetail: View {
     @Bindable var folder: FolderModel
 
@@ -167,10 +167,16 @@ struct FolderDetail: View {
         Group {
             if let session = folder.session {
                 RunView(folder: folder, session: session)
+            } else if let run = folder.moveRun {
+                MoveRunView(folder: folder, run: run)
+            } else if let run = folder.undoRun {
+                UndoRunView(folder: folder, run: run)
             } else {
                 switch folder.tab {
                 case .overview: OverviewView(folder: folder)
                 case .review: ReviewTab(folder: folder)
+                case .apply: ApplyTab(folder: folder)
+                case .history: HistoryView(folder: folder)
                 }
             }
         }
@@ -183,8 +189,8 @@ struct FolderDetail: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .disabled(folder.session != nil)
-                .help(folder.session != nil ? "Finish or close Scan & Plan first" : "")
+                .disabled(folder.showsRun)
+                .help(folder.showsRun ? "Finish or close the run first" : "")
             }
         }
         .task { await folder.refresh() }

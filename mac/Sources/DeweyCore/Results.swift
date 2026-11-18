@@ -118,12 +118,22 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
         public var summary: PlanSummary
     }
 
-    public struct Batch: Decodable, Sendable, Equatable {
+    public struct Batch: Decodable, Sendable, Equatable, Identifiable {
         public var batch: String
         public var moves: Int
         public var undone: Int
         public var planId: Int?
         public var movedAt: String?
+        /// Whole folders among the moves (dewey before the app's Phase 5 doesn't say: 0).
+        public var folders: Int?
+
+        public var id: String { batch }
+        /// "4 files and 2 folders".
+        public var movesText: String {
+            ProgressText.items(files: moves - (folders ?? 0), folders: folders ?? 0)
+        }
+        /// Moves not put back yet.
+        public var out: Int { max(0, moves - undone) }
     }
 
     public struct LabelCount: Decodable, Sendable, Equatable {

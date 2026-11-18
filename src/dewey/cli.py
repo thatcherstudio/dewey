@@ -172,9 +172,11 @@ def status_data(conn, root: Path, state: Path) -> dict:
               "report": p["report_path"], "summary": json.loads(p["summary"] or "{}")}
              for p in conn.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 20")]
     batches = [{"batch": b["batch"], "moves": b["n"], "undone": b["u"] or 0, "plan_id": b["plan_id"],
-                "moved_at": b["moved_at"]}
+                "moved_at": b["moved_at"], "folders": b["f"] or 0}
                for b in conn.execute("SELECT batch, COUNT(*) n, SUM(undone_at IS NOT NULL) u, MIN(plan_id) plan_id, "
-                                     "MIN(moved_at) moved_at FROM moves GROUP BY batch ORDER BY MAX(id) DESC LIMIT 20")]
+                                     "MIN(moved_at) moved_at, SUM(EXISTS(SELECT 1 FROM plan_rows p WHERE "
+                                     "p.plan_id = moves.plan_id AND p.row = moves.row AND p.action = 'folder')) f "
+                                     "FROM moves GROUP BY batch ORDER BY MAX(id) DESC LIMIT 20")]
     labels = [{"source": r["source"], "n": r["n"]}
               for r in conn.execute("SELECT source, COUNT(*) n FROM labels GROUP BY source")]
     errors = [{"path": e["rel_path"], "error": e["error"]} for e in conn.execute(

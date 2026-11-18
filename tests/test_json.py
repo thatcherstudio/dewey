@@ -137,6 +137,9 @@ class JsonInterface(unittest.TestCase):
         status = self.result("status", R)
         self.assertEqual(status["undoable"], applied["batch"])
         self.assertEqual(status["batches"][0]["moves"], applied["counts"]["moved"])
+        kinds = [m["kind"] for m in applied["moved"]]                 # the app says "4 files and 2 folders"
+        self.assertLessEqual(set(kinds), {"file", "folder"})
+        self.assertEqual(status["batches"][0]["folders"], kinds.count("folder"))
         self.assertGreater(self.result("export-labels", R)["count"], 0)
 
         undo = self.result("undo", R)

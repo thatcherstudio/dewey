@@ -20,7 +20,8 @@ struct OverviewView: View {
                 }
                 if let status = folder.status {
                     if status.catalog {
-                        StatusCards(status: status, review: { folder.openReview() })
+                        StatusCards(status: status, review: { folder.openReview() },
+                                    apply: { folder.tab = .apply }, history: { folder.tab = .history })
                         if !status.errors.isEmpty, let scan = status.scan {
                             ScanErrorsView(errors: status.errors, total: scan.errors ?? status.errors.count)
                         }
@@ -91,6 +92,8 @@ struct OverviewView: View {
 struct StatusCards: View {
     let status: FolderStatus
     var review: () -> Void = {}
+    var apply: () -> Void = {}
+    var history: () -> Void = {}
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 16, alignment: .top)], alignment: .leading,
@@ -154,6 +157,7 @@ struct StatusCards: View {
                 .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("Review", action: review).buttonStyle(.borderedProminent)
+                    Button("Apply", action: apply)
                     Button("Open CSV") { FolderModel.open(plan.csv) }.disabled(plan.csv == nil)
                     Button("Report") { FolderModel.open(plan.report) }.disabled(plan.report == nil)
                 }
@@ -185,9 +189,13 @@ struct StatusCards: View {
                     Text("Moved \(date.formatted(.relative(presentation: .named)))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if status.undoable != nil {
-                    Text("Can be undone").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("History", action: history)
+                    if status.undoable != nil {
+                        Text("Can be undone").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
+                .controlSize(.small)
             } else {
                 Big("Nothing moved yet")
                 Text("Files move only when you apply a plan.").foregroundStyle(.secondary)

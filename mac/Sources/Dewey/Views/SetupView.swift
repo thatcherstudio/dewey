@@ -2,15 +2,6 @@ import AppKit
 import DeweyCore
 import SwiftUI
 
-struct ContentView: View {
-    var body: some View {
-        SetupView()
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) { LayaStatusView() }
-            }
-    }
-}
-
 /// Green/red checks for everything Dewey needs, each red one with the exact command that fixes it.
 struct SetupView: View {
     @Environment(AppModel.self) private var model

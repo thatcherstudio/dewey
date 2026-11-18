@@ -7,6 +7,7 @@ enum Prefs {
     static let layaServePath = "layaServePath"
     static let layaURL = "layaURL"
     static let startLayaOnLaunch = "startLayaOnLaunch"
+    static let selection = "selection"
     static let defaultLayaURL = "http://127.0.0.1:8000"
 
     static func register() {
@@ -36,13 +37,32 @@ final class AppModel {
 
     var dewey: Check = .checking
     var layaServe: Check = .checking
+    /// False until the first check finishes (the window shows a spinner, not a flash of setup).
+    var checkedOnce = false
+    /// dewey passed its last finished check, so "Check Again" keeps the main window up while it runs.
+    var lastDeweyOK = false
     var deweyURL: URL?
     var layaServeURL: URL?
     var appInfo: AppInfo?
     let laya: LayaController
 
+    let folders = FolderStore()
+    var selection: SidebarItem? {
+        didSet { UserDefaults.standard.set(selection?.storageKey, forKey: Prefs.selection) }
+    }
+    @ObservationIgnored private var folderModels: [String: FolderModel] = [:]
+
     var cli: DeweyCLI? { deweyURL.map { DeweyCLI(executable: $0) } }
     var deweyReady: Bool { dewey.isOK }
+    /// The sidebar and folders, rather than the setup screen. Only dewey is required: without Laya,
+    /// plans use rules and duplicates only.
+    var showsMain: Bool {
+        switch dewey {
+        case .ok: true
+        case .checking: lastDeweyOK
+        case .problem: false
+        }
+    }
     var everythingReady: Bool {
         if case .ready = laya.status { return dewey.isOK && layaServe.isOK }
         return false
@@ -54,6 +74,12 @@ final class AppModel {
     init() {
         Prefs.register()
         laya = LayaController(baseURL: Self.layaBaseURL())
+        selection = SidebarItem(storageKey: UserDefaults.standard.string(forKey: Prefs.selection))
+            .flatMap { item in
+                if case .folder(let p) = item, !folders.paths.contains(p) { return nil }
+                return item
+            }
+            ?? folders.paths.first.map(SidebarItem.folder)
     }
 
     static func layaBaseURL() -> URL {
@@ -111,12 +137,66 @@ final class AppModel {
                                  : "The laya-serve path in Settings (\(layaPref)) isn't an executable file.")
         }
         await laya.refresh()
+        lastDeweyOK = dewey.isOK
+        checkedOnce = true
     }
 
     func startLaya() async {
         guard let url = layaServeURL else { return }
         if !laya.isRunning { laya.baseURL = Self.layaBaseURL() }
         await laya.start(executable: url)
+    }
+
+    // MARK: - folders
+
+    /// The model behind one sidebar folder, made on first use and kept while the app runs, so a scan
+    /// keeps going when you look at another folder.
+    func folder(_ path: String) -> FolderModel {
+        if let f = folderModels[path] { return f }
+        let f = FolderModel(path: path, app: self)
+        folderModels[path] = f
+        return f
+    }
+
+    /// Folders with a scan or plan running.
+    var busyFolders: [FolderModel] {
+        folders.paths.compactMap { folderModels[$0] }.filter(\.isRunning)
+    }
+
+    func chooseFolders() {
+        let panel = NSOpenPanel()
+        panel.title = "Add a folder for Dewey to organize"
+        panel.prompt = "Add"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        add(panel.urls)
+    }
+
+    /// Adds folders (files are ignored) and selects the first one.
+    func add(_ urls: [URL]) {
+        let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        var first: String?
+        for url in dirs.reversed() { first = folders.add(url) }  // reversed: they end up in the order chosen
+        if let first { selection = .folder(first) }
+    }
+
+    func removeFolder(_ path: String) {
+        guard !(folderModels[path]?.isRunning ?? false) else { return }
+        let index = folders.paths.firstIndex(of: path)
+        folders.remove(path)
+        folderModels[path] = nil
+        if selection == .folder(path) {
+            let next = index.flatMap { folders.paths.indices.contains($0) ? folders.paths[$0] : folders.paths.last }
+            selection = next.map(SidebarItem.folder)
+        }
+    }
+
+    /// App quit: SIGINT every running dewey, like Ctrl-C (it saves what's done and exits on its own).
+    func cancelAllRuns() {
+        for f in busyFolders { f.session?.cancel() }
     }
 
     /// Pick an executable with an open panel and remember it in Settings.
@@ -132,5 +212,23 @@ final class AppModel {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         UserDefaults.standard.set(url.path, forKey: key)
         Task { await checkAll() }
+    }
+}
+
+/// What the sidebar has selected.
+enum SidebarItem: Hashable {
+    case setup
+    case folder(String)
+
+    var storageKey: String {
+        switch self {
+        case .setup: "setup"
+        case .folder(let p): p
+        }
+    }
+
+    init?(storageKey: String?) {
+        guard let k = storageKey, !k.isEmpty else { return nil }
+        self = k == "setup" ? .setup : .folder(k)
     }
 }

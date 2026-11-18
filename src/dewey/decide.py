@@ -23,6 +23,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from .errors import CONFIG, DeweyExit
+
 
 class DecisionError(RuntimeError):
     pass
@@ -71,7 +73,7 @@ def _unreadable(resp, e: Exception) -> DecisionError:
 def _check_url(url) -> str:
     url = str(url)
     if not url.startswith(("http://", "https://")):
-        raise SystemExit(f"decider url must start with http:// or https:// (got {url!r})")
+        raise DeweyExit(f"decider url must start with http:// or https:// (got {url!r})", CONFIG)
     return url
 
 
@@ -218,7 +220,7 @@ def make(cfg: dict, backend_override: str | None = None):
     if backend == "chat":
         cap = None if d.get("trust_chat_confidence") else max(0.0, float(cfg["plan"]["auto_confidence"]) - 0.01)
         return ChatDecider(_check_url(d["url"]), d["model"], float(d["timeout"]), cap)
-    raise SystemExit(f"unknown decider backend: {backend}")
+    raise DeweyExit(f"unknown decider backend: {backend}", CONFIG)
 
 
 PROBE_STATE = {"file_name": "Chase_Statement_2024-03.pdf", "folder": "Downloads", "extension": ".pdf",

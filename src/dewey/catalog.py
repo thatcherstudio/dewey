@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import extract
+from .errors import CONFIG, DeweyExit
 from .progress import Progress, human_bytes, say
 
 SCHEMA = """
@@ -224,9 +225,9 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
         try:
             import blake3  # noqa: F401
         except ImportError:
-            raise SystemExit("scan.hash = 'blake3' but the blake3 package isn't installed (pip install blake3)")
+            raise DeweyExit("scan.hash = 'blake3' but the blake3 package isn't installed (pip install blake3)", CONFIG)
     elif algo not in hashlib.algorithms_available:
-        raise SystemExit(f"unknown hash algorithm: {algo}")
+        raise DeweyExit(f"unknown hash algorithm: {algo}", CONFIG)
     check_root(conn, root)
     cur = conn.execute("INSERT INTO scans (started, root) VALUES (?, ?)", (now_iso(), str(root)))
     scan_id = cur.lastrowid
@@ -284,7 +285,11 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
     total_bytes = sum(e.size for e in todo)
     prog = Progress("Hashing", total=len(todo), total_bytes=total_bytes or None)
     limit = int(sc["snippet_chars"])
-    with ThreadPoolExecutor(max_workers=max(1, int(sc["workers"]))) as pool:
+    # Not `with ThreadPoolExecutor`: leaving that block waits for the whole queue, so Ctrl-C on a big
+    # folder kept hashing to the end. On any exit, queued files are dropped (only the ones in flight
+    # finish) and the hashes done so far are kept for the next scan.
+    pool = ThreadPoolExecutor(max_workers=max(1, int(sc["workers"])))
+    try:
         futures = [pool.submit(_work, e, algo, limit) for e in todo]
         for i, fut in enumerate(as_completed(futures), 1):
             e, h, snip, pdate, cam, err = fut.result()
@@ -294,6 +299,11 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
             prog.update(1, e.size)
             if i % 1000 == 0:
                 conn.commit()
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        conn.commit()
+        raise
+    pool.shutdown()
     conn.commit()
     if todo:
         prog.done()
@@ -308,7 +318,8 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
     conn.executemany("INSERT INTO scan_errors VALUES (?, ?, ?)", [(scan_id, r, m) for r, m in errors])
     conn.commit()
     stats = dict(scan_id=scan_id, files=nfiles, bytes=nbytes, hashed=len(todo), reused=reused,
-                 units=units, missing=missing, errors=errors)
+                 units=units, cloud=cloud, missing=missing, errors=len(errors),
+                 error_items=[{"path": r, "error": m} for r, m in errors[:50]])
     say(f"Scan {scan_id}: {nfiles:,} files ({human_bytes(nbytes)}), hashed {len(todo):,}, "
         f"reused {reused:,}, {units} bundle/project units, "
         + (f"{cloud:,} cloud-only (not downloaded, skipped), " if cloud else "") +

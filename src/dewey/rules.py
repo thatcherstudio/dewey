@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from .errors import CONFIG, DeweyExit
+
 
 class _Blank(dict):
     def __missing__(self, key):
@@ -53,7 +55,7 @@ def compile_rules(cfg: dict) -> list[Rule]:
                 has_camera=r.get("has_camera"),
             ))
         except re.error as e:
-            raise SystemExit(f"config: bad regex in rule {r.get('name')}: {e}")
+            raise DeweyExit(f"config: bad regex in rule {r.get('name')}: {e}", CONFIG)
     return out
 
 

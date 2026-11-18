@@ -23,6 +23,7 @@ from pathlib import Path
 from . import decide as dmod
 from . import folders as fkind
 from .catalog import UNIT_KINDS, now_iso
+from .errors import DECIDER, NO_CATALOG, DeweyExit
 from .progress import Progress, human_bytes, say
 from .rules import compile_rules, file_date, fill, first_match
 
@@ -84,9 +85,12 @@ def decide_all(conn: sqlite3.Connection, decider, items: list, cfg: dict, option
         return out
     prog = Progress("Deciding", total=len(todo))
     errors_in_a_row = 0
-    with ThreadPoolExecutor(max_workers=max(1, int(cfg["decider"]["workers"]))) as pool:
+    # Not `with ThreadPoolExecutor` (it waits for the whole queue on Ctrl-C). On any exit, queued
+    # requests are dropped and every answer so far stays in the cache, so a rerun picks up from here.
+    pool = ThreadPoolExecutor(max_workers=max(1, int(cfg["decider"]["workers"])))
+    try:
         futs = {pool.submit(decider.choose, st, q, options): (f, st, key) for f, st, key in todo}
-        for fut in as_completed(futs):
+        for i, fut in enumerate(as_completed(futs), 1):
             f, st, key = futs[fut]
             try:
                 dec = fut.result()
@@ -99,11 +103,15 @@ def decide_all(conn: sqlite3.Connection, decider, items: list, cfg: dict, option
                 errors_in_a_row += 1
                 out.append((f, st, None, str(e)))
                 if errors_in_a_row >= 25:
-                    for other in futs:
-                        other.cancel()
-                    conn.commit()
-                    raise SystemExit(f"decider failed 25 times in a row; last error: {e}")
+                    raise DeweyExit(f"decider failed 25 times in a row; last error: {e}", DECIDER)
             prog.update(1)
+            if i % 100 == 0:
+                conn.commit()
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        conn.commit()
+        raise
+    pool.shutdown()
     conn.commit()
     prog.done()
     return out
@@ -120,7 +128,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
     dest_root = Path(p["dest"]).expanduser().resolve() if p["dest"] else root
     scan = conn.execute("SELECT * FROM scans WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     if not scan:
-        raise SystemExit("no completed scan yet; run `dewey scan` first")
+        raise DeweyExit("no completed scan yet; run `dewey scan` first", NO_CATALOG)
     algo = (conn.execute("SELECT hash_algo FROM files WHERE hash_algo IS NOT NULL LIMIT 1").fetchone() or ["hash"])[0]
     files = conn.execute("SELECT * FROM files WHERE missing=0").fetchall()
     regular = [f for f in files if f["kind"] == "file" and f["hash"]]
@@ -200,8 +208,8 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
         ok, msg = dmod.probe(decider, cfg)
         say(("Decider ok: " if ok else "Decider FAILED: ") + msg)
         if not ok:
-            raise SystemExit("Start the decision model server (see README), fix [decider] in dewey.toml, "
-                             "or rerun with --backend none for rules only.")
+            raise DeweyExit("Start the decision model server (see README), fix [decider] in dewey.toml, "
+                            "or rerun with --backend none for rules only.", DECIDER)
     auto_c, rev_c = float(p["auto_confidence"]), float(p["review_confidence"])
     if decider.kind == "none":
         counts["no_rule_matched"] = len(queue)
@@ -293,7 +301,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
         f"Includes {summary['duplicate']['n']:,} exact duplicates -> {review}/Duplicates "
         f"({human_bytes(summary['duplicate']['bytes'])} reclaimable)")
     say(f"  report: {report_path}\n  plan:   {csv_path}")
-    return dict(plan_id=plan_id, csv=csv_path, report=report_path, summary=summary)
+    return dict(plan_id=plan_id, csv=str(csv_path), report=str(report_path), summary=summary)
 
 
 def _plan_folders(cfg: dict, root: Path, review: str, max_depth: int, whole: dict, units: list,

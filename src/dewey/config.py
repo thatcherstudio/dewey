@@ -11,6 +11,8 @@ import os
 import tomllib
 from pathlib import Path
 
+from .errors import CONFIG, DeweyExit
+
 STATE_DIRNAME = ".dewey"
 
 DEFAULT_TOML = r'''
@@ -246,7 +248,7 @@ def find_config(state_dir: Path, explicit: str | None) -> Path | None:
     if explicit:
         p = Path(explicit).expanduser()
         if not p.is_file():
-            raise SystemExit(f"config not found: {p}")
+            raise DeweyExit(f"config not found: {p}", CONFIG)
         return p
     for p in (state_dir / "dewey.toml",
               Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dewey" / "dewey.toml"):
@@ -259,8 +261,11 @@ def load(state_dir: Path, explicit: str | None = None) -> tuple[dict, Path | Non
     path = find_config(state_dir, explicit)
     if path is None:
         return copy.deepcopy(DEFAULTS), None
-    with open(path, "rb") as fh:
-        user = tomllib.load(fh)
+    try:
+        with open(path, "rb") as fh:
+            user = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:  # a typo in dewey.toml: say where, not a traceback
+        raise DeweyExit(f"config: {path} isn't valid TOML: {e}", CONFIG) from None
     cfg = _merge(DEFAULTS, user)
     validate(cfg)
     return cfg, path
@@ -269,17 +274,17 @@ def load(state_dir: Path, explicit: str | None = None) -> tuple[dict, Path | Non
 def validate(cfg: dict) -> None:
     cats = cfg.get("categories") or {}
     if cfg["decider"]["backend"] != "none" and len(cats) < 2:
-        raise SystemExit("config: [categories] needs at least 2 entries for the decider")
+        raise DeweyExit("config: [categories] needs at least 2 entries for the decider", CONFIG)
     if len(cats) > 255:
-        raise SystemExit("config: decision models cap a choice at 255 options; split into two stages")
+        raise DeweyExit("config: decision models cap a choice at 255 options; split into two stages", CONFIG)
     for key, c in cats.items():
         if "path" not in c or "desc" not in c:
-            raise SystemExit(f"config: categories.{key} needs both path and desc")
+            raise DeweyExit(f"config: categories.{key} needs both path and desc", CONFIG)
     for r in cfg.get("rules", []):
         if "name" not in r or "target" not in r:
-            raise SystemExit(f"config: every [[rules]] entry needs name and target: {r}")
+            raise DeweyExit(f"config: every [[rules]] entry needs name and target: {r}", CONFIG)
     p = cfg["plan"]
     if not (0 <= p["review_confidence"] <= p["auto_confidence"] <= 1):
-        raise SystemExit("config: need 0 <= review_confidence <= auto_confidence <= 1")
+        raise DeweyExit("config: need 0 <= review_confidence <= auto_confidence <= 1", CONFIG)
     if p["keep_duplicate"] not in ("oldest", "newest", "shortest_path"):
-        raise SystemExit("config: plan.keep_duplicate must be oldest | newest | shortest_path")
+        raise DeweyExit("config: plan.keep_duplicate must be oldest | newest | shortest_path", CONFIG)

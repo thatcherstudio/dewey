@@ -9,3 +9,5 @@ dist/
 .DS_Store
 # local working notes, not published
 PROJECT.md
+.build/
+.swiftpm/

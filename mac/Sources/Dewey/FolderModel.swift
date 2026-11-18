@@ -3,7 +3,7 @@ import DeweyCore
 import Observation
 
 /// One folder in the sidebar: what `dewey status` says about it, its Scan & Plan run, the review of
-/// its latest plan, and moving files (Apply) and putting them back (History).
+/// its latest plan, moving files (Apply) and putting them back (History), and its settings.
 @MainActor @Observable
 final class FolderModel {
     enum Tab: String, CaseIterable, Identifiable {
@@ -11,6 +11,7 @@ final class FolderModel {
         case review = "Review"
         case apply = "Apply"
         case history = "History"
+        case settings = "Settings"
         var id: String { rawValue }
     }
 
@@ -18,6 +19,8 @@ final class FolderModel {
     var tab: Tab = .overview
     var status: FolderStatus?
     var statusError: String?
+    /// The error's code (see src/dewey/errors.py): "config" means dewey.toml needs fixing in Settings.
+    var statusErrorCode: String?
     var loading = false
     /// The current or last Scan & Plan. Kept until "Done", so you can look away and come back.
     var session: ScanPlanSession?
@@ -29,6 +32,8 @@ final class FolderModel {
     var moveRun: CommandRun<ApplyResult>?
     /// Files going back (History's Undo).
     var undoRun: CommandRun<UndoResult>?
+    /// The Settings tab: this folder's dewey.toml, made the first time it opens.
+    var settings: FolderSettings?
     @ObservationIgnored private weak var app: AppModel?
 
     init(path: String, app: AppModel) {
@@ -52,7 +57,9 @@ final class FolderModel {
         if moveRun?.isActive == true { return "moving files" }
         return "Scan & Plan"
     }
+    /// Review has changes not saved into plan-N.csv (Apply waits for them).
     var hasUnsavedChanges: Bool { review?.hasChanges ?? false }
+    var hasUnsavedSettings: Bool { settings?.hasChanges ?? false }
 
     /// Still there (an external disk may be unplugged, a folder renamed in Finder).
     var exists: Bool {
@@ -69,8 +76,10 @@ final class FolderModel {
         do {
             status = try await cli.run(["status", path], as: FolderStatus.self)
             statusError = nil
+            statusErrorCode = nil
         } catch {
             statusError = error.localizedDescription
+            if case .failed(let code, _) = error as? DeweyError { statusErrorCode = code } else { statusErrorCode = nil }
         }
     }
 
@@ -166,6 +175,20 @@ final class FolderModel {
             if FileManager.default.fileExists(atPath: url.path) { return url }
         }
         return nil
+    }
+
+    func makeSettings() {
+        guard settings == nil, let cli = app?.cli else { return }
+        settings = FolderSettings(cli: cli, root: path)
+    }
+
+    /// New settings: category paths change where planned rows go, and Review's category list.
+    func settingsSaved() {
+        Task {
+            if statusErrorCode == "config" { await refresh() }
+            if let review, !review.hasChanges { await review.load() }
+            if apply != nil { await apply?.refresh() }
+        }
     }
 
     func makeReview() {

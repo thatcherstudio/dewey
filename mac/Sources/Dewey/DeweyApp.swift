@@ -38,16 +38,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A scan or move in progress is safe to stop (it keeps what's done, moves stay undoable), but say so
     /// before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let unsaved = model.foldersWithUnsavedChanges
-        if !unsaved.isEmpty {
+        let unsaved = model.foldersWithUnsavedChanges, unsavedSettings = model.foldersWithUnsavedSettings
+        if !unsaved.isEmpty || !unsavedSettings.isEmpty {
             let alert = NSAlert()
-            alert.messageText = "Quit without saving your changes to the plan?"
-            alert.informativeText = "Review has unsaved changes for "
-                + unsaved.map(\.name).joined(separator: ", ") + ". Quitting drops them; the plan stays as it was."
-            alert.addButton(withTitle: "Keep Reviewing")
+            alert.messageText = unsavedSettings.isEmpty ? "Quit without saving your changes to the plan?"
+                : unsaved.isEmpty ? "Quit without saving your settings?" : "Quit without saving your changes?"
+            alert.informativeText = [
+                unsaved.isEmpty ? nil : "Review has unsaved changes for \(unsaved.map(\.name).joined(separator: ", ")).",
+                unsavedSettings.isEmpty ? nil
+                    : "Settings has unsaved changes for \(unsavedSettings.map(\.name).joined(separator: ", ")).",
+                "Quitting drops them; the files on disk stay as they were.",
+            ].compactMap { $0 }.joined(separator: " ")
+            alert.addButton(withTitle: "Keep Editing")
             alert.addButton(withTitle: "Quit Anyway")
             guard alert.runModal() == .alertSecondButtonReturn else {
-                if let f = unsaved.first { model.selection = .folder(f.path); f.openReview() }
+                if let f = unsaved.first {
+                    model.selection = .folder(f.path)
+                    f.openReview()
+                } else if let f = unsavedSettings.first {
+                    model.selection = .folder(f.path)
+                    f.tab = .settings
+                }
                 return .terminateCancel
             }
         }

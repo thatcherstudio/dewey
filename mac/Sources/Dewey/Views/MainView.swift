@@ -123,8 +123,9 @@ struct FolderRow: View {
             Spacer(minLength: 4)
             if folder.isRunning {
                 ProgressView().controlSize(.small)
-            } else if folder.hasUnsavedChanges {
-                Circle().fill(.blue).frame(width: 7, height: 7).help("Unsaved changes to the plan")
+            } else if folder.hasUnsavedChanges || folder.hasUnsavedSettings {
+                Circle().fill(.blue).frame(width: 7, height: 7)
+                    .help(folder.hasUnsavedChanges ? "Unsaved changes to the plan" : "Unsaved settings")
             }
         }
         .help(folder.exists ? folder.displayPath : "\(folder.displayPath) isn't there any more")
@@ -177,6 +178,7 @@ struct FolderDetail: View {
                 case .review: ReviewTab(folder: folder)
                 case .apply: ApplyTab(folder: folder)
                 case .history: HistoryView(folder: folder)
+                case .settings: SettingsTab(folder: folder)
                 }
             }
         }

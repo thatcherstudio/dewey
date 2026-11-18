@@ -3,15 +3,24 @@
 `dewey init ROOT` writes DEFAULT_TOML to ROOT/.dewey/dewey.toml for editing.
 User values override defaults key-by-key; [[rules]] and [categories] replace
 the defaults wholesale when present (merging rule lists is more confusing than useful).
+
+The Mac app reads settings with `read_settings` and saves them with `write_settings`, which writes
+only what differs from the defaults (through `dumps`, a small TOML writer: tomllib only reads).
 """
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
 import os
+import re
+import shutil
+import tempfile
 import tomllib
 from pathlib import Path
 
-from .errors import CONFIG, DeweyExit
+from .errors import CONFIG, STALE, DeweyExit
+from .folders import LABELS as FOLDER_LABELS
 
 STATE_DIRNAME = ".dewey"
 
@@ -261,14 +270,68 @@ def load(state_dir: Path, explicit: str | None = None) -> tuple[dict, Path | Non
     path = find_config(state_dir, explicit)
     if path is None:
         return copy.deepcopy(DEFAULTS), None
-    try:
-        with open(path, "rb") as fh:
-            user = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as e:  # a typo in dewey.toml: say where, not a traceback
-        raise DeweyExit(f"config: {path} isn't valid TOML: {e}", CONFIG) from None
-    cfg = _merge(DEFAULTS, user)
+    cfg = _merge(DEFAULTS, _parse(path.read_bytes().decode("utf-8", errors="replace"), path))
+    check_types(cfg)
     validate(cfg)
     return cfg, path
+
+
+def _parse(text: str, path: Path) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:  # a typo in dewey.toml: say where, not a traceback
+        raise DeweyExit(f"config: {path} isn't valid TOML: {e}", CONFIG) from None
+
+
+# in the order the default file writes them: name, what it matches, where it goes
+RULE_TYPES = {"name": str, "ext": list, "name_regex": str, "path_regex": str, "min_size": int, "max_size": int,
+              "has_camera": bool, "target": str, "reason": str}
+
+
+def _type_ok(value, like) -> bool:
+    """`value` may stand where `like` is: bool is not a number, an int may be a float, lists hold strings."""
+    if isinstance(like, bool) or like is bool:
+        return isinstance(value, bool)
+    if isinstance(like, float) or like is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(like, int) or like is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(like, list) or like is list:
+        return isinstance(value, list) and all(isinstance(x, str) for x in value)
+    return isinstance(value, type(like) if not isinstance(like, type) else like)
+
+
+def _type_name(like) -> str:
+    t = like if isinstance(like, type) else type(like)
+    return {bool: "true or false", int: "a whole number", float: "a number", str: "text",
+            list: "a list of text"}.get(t, t.__name__)
+
+
+def check_types(cfg: dict) -> None:
+    """Every known setting has the type of its default (a typo like workers = "4" says so here,
+    instead of failing halfway through a scan). Settings dewey doesn't know are left alone."""
+    for sec in ("scan", "plan", "folders", "decider"):
+        if not isinstance(cfg.get(sec), dict):
+            raise DeweyExit(f"config: [{sec}] must be a table", CONFIG)
+        for k, v in cfg[sec].items():
+            like = DEFAULTS[sec].get(k, str if sec == "folders" else None)
+            if like is not None and not _type_ok(v, like):
+                raise DeweyExit(f"config: {sec}.{k} must be {_type_name(like)}, not {v!r}", CONFIG)
+    rules = cfg.get("rules", [])
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise DeweyExit("config: rules must be a list of [[rules]] tables", CONFIG)
+    for r in rules:
+        for k, like in RULE_TYPES.items():
+            if k in r and not _type_ok(r[k], like):
+                raise DeweyExit(f"config: rule {r.get('name', '?')!r}: {k} must be {_type_name(like)}, "
+                                f"not {r[k]!r}", CONFIG)
+    cats = cfg.get("categories", {})
+    if not isinstance(cats, dict) or not all(isinstance(c, dict) for c in cats.values()):
+        raise DeweyExit("config: categories must be [categories.KEY] tables", CONFIG)
+    for key, c in cats.items():
+        for k in ("path", "desc"):
+            if k in c and not isinstance(c[k], str):
+                raise DeweyExit(f"config: categories.{key}.{k} must be text, not {c[k]!r}", CONFIG)
 
 
 def validate(cfg: dict) -> None:
@@ -288,3 +351,290 @@ def validate(cfg: dict) -> None:
         raise DeweyExit("config: need 0 <= review_confidence <= auto_confidence <= 1", CONFIG)
     if p["keep_duplicate"] not in ("oldest", "newest", "shortest_path"):
         raise DeweyExit("config: plan.keep_duplicate must be oldest | newest | shortest_path", CONFIG)
+    if "" in cats:
+        raise DeweyExit("config: a category needs a name (categories has an empty key)", CONFIG)
+    if cfg["decider"]["backend"] not in ("systemone", "chat", "none"):
+        raise DeweyExit("config: decider.backend must be systemone | chat | none", CONFIG)
+    if cfg["scan"]["hash"] not in ("sha256", "blake3"):
+        raise DeweyExit("config: scan.hash must be sha256 | blake3", CONFIG)
+    for sec, k, low in (("scan", "workers", 1), ("decider", "workers", 1), ("scan", "snippet_chars", 0),
+                        ("plan", "max_depth", -1)):
+        if cfg[sec][k] < low:
+            raise DeweyExit(f"config: {sec}.{k} must be {low} or more", CONFIG)
+    if cfg["decider"]["timeout"] <= 0:
+        raise DeweyExit("config: decider.timeout must be more than 0 seconds", CONFIG)
+
+
+# --- writing TOML -----------------------------------------------------------------------------
+
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _toml_str(s: str) -> str:
+    """A TOML basic string. Not json.dumps: JSON leaves DEL (0x7f) raw and writes emoji as surrogate
+    pairs (\\ud83d\\ude00), and TOML allows neither."""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch in _ESCAPES:
+            out.append(_ESCAPES[ch])
+        elif o < 0x20 or o == 0x7F:
+            out.append(f"\\u{o:04X}")
+        elif 0xD800 <= o <= 0xDFFF:
+            raise ValueError(f"not valid text (a lone surrogate): {s!r}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _toml_key(k) -> str:
+    if not isinstance(k, str):
+        raise TypeError(f"TOML keys are text, not {k!r}")
+    return k if _BARE_KEY.fullmatch(k) else _toml_str(k)
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):  # before int: True is an int too
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "nan"
+        if math.isinf(v):
+            return "inf" if v > 0 else "-inf"
+        return repr(v)  # always has a "." or an exponent: 1.0, 1e-05
+    if isinstance(v, str):
+        return _toml_str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{_toml_key(k)} = {_toml_value(x)}" for k, x in v.items()) + "}"
+    raise TypeError(f"TOML can't hold {v!r}")  # None included: TOML has no null
+
+
+def _table_list(v) -> bool:
+    return isinstance(v, list) and len(v) > 0 and all(isinstance(x, dict) for x in v)
+
+
+def dumps(doc: dict) -> str:
+    """TOML text for `doc`: plain values first, then [tables], then [[lists of tables]]."""
+    lines: list[str] = []
+    _dump_table(lines, (), doc, "table")
+    return "\n".join(lines).strip("\n") + "\n" if lines else ""
+
+
+def _dump_table(lines: list, path: tuple, table: dict, kind: str) -> None:
+    plain = [(k, v) for k, v in table.items() if not isinstance(v, dict) and not _table_list(v)]
+    tables = [(k, v) for k, v in table.items() if isinstance(v, dict)]
+    lists = [(k, v) for k, v in table.items() if _table_list(v)]
+    name = ".".join(_toml_key(k) for k in path)
+    if kind == "list":
+        lines += ["", f"[[{name}]]"]
+    elif path and (plain or not (tables or lists)):  # a table holding only tables needs no header
+        lines += ["", f"[{name}]"]
+    lines += [f"{_toml_key(k)} = {_toml_value(v)}" for k, v in plain]
+    for k, v in tables:
+        _dump_table(lines, path + (k,), v, "table")
+    for k, v in lists:
+        for item in v:
+            _dump_table(lines, path + (k,), item, "list")
+
+
+# --- settings for the Mac app -----------------------------------------------------------------
+
+SETTINGS_HEADER = """\
+# dewey settings for this folder, saved by the Dewey app.
+# Only settings that differ from dewey's built-in defaults are here; everything else uses the
+# default, so improvements to the defaults still reach this folder. The app rewrites this file when
+# it saves (comments added here aren't kept); the previous version is kept as dewey.toml.bak.
+# `dewey init --force ROOT` replaces it with the full default file, every setting explained.
+"""
+
+
+def settings_path(state_dir: Path, explicit: str | None = None) -> Path:
+    """The file the app's settings are saved to: the folder's own dewey.toml."""
+    return Path(explicit).expanduser() if explicit else state_dir / "dewey.toml"
+
+
+def to_app(cfg: dict) -> dict:
+    """The settings as the app edits them: categories and folder kinds are ordered lists (JSON
+    objects lose their order in Swift, and the decider reads the categories in order)."""
+    out = {k: copy.deepcopy(v) for k, v in cfg.items() if k not in ("folders", "categories")}
+    f = cfg.get("folders", {})
+    out["folders"] = {"move": f.get("move", True),
+                      "kinds": [{"kind": k, "path": v, "label": FOLDER_LABELS.get(k, k)}
+                                for k, v in f.items() if k != "move" and isinstance(v, str)]}
+    out["categories"] = [{"key": k, "path": c.get("path", ""), "desc": c.get("desc", "")}
+                         for k, c in cfg.get("categories", {}).items()]
+    return out
+
+
+def from_app(data) -> dict:
+    """The app's settings (any subset of the sections `to_app` gives) as config, ready to merge."""
+    def bad(msg):
+        return DeweyExit(f"settings: {msg}", CONFIG)
+
+    if not isinstance(data, dict):
+        raise bad("expected a JSON object")
+    out: dict = {}
+    for sec, v in data.items():
+        if sec in ("scan", "plan", "decider"):
+            if not isinstance(v, dict):
+                raise bad(f"{sec} must be an object")
+            out[sec] = {}
+            for k, x in v.items():
+                if k not in DEFAULTS[sec]:
+                    raise bad(f"unknown setting {sec}.{k}")
+                if isinstance(DEFAULTS[sec][k], float) and isinstance(x, int) and not isinstance(x, bool):
+                    x = float(x)  # 1 from JSON: write 1.0
+                out[sec][k] = x
+        elif sec == "folders":
+            if not isinstance(v, dict):
+                raise bad("folders must be an object")
+            f = {}
+            for k, x in v.items():
+                if k == "move":
+                    f["move"] = x
+                elif k == "kinds":
+                    for item in x if isinstance(x, list) else [None]:
+                        if not isinstance(item, dict) or item.get("kind") not in DEFAULTS["folders"]:
+                            raise bad(f"unknown folder kind {item!r}")
+                        f[item["kind"]] = item.get("path", "")
+                else:
+                    raise bad(f"unknown setting folders.{k}")
+            out["folders"] = f
+        elif sec == "rules":
+            if not isinstance(v, list) or not all(isinstance(r, dict) for r in v):
+                raise bad("rules must be a list of objects")
+            for r in v:
+                extra = set(r) - set(RULE_TYPES)
+                if extra:
+                    raise bad(f"unknown rule setting {', '.join(sorted(extra))}")
+            # in the order a person would write them (the app sends keys sorted)
+            out["rules"] = [{k: r[k] for k in RULE_TYPES if r.get(k) is not None} for r in v]
+        elif sec == "categories":
+            if not isinstance(v, list) or not all(isinstance(c, dict) for c in v):
+                raise bad("categories must be a list of {key, path, desc}")
+            cats: dict = {}
+            for c in v:
+                key = c.get("key")
+                if not isinstance(key, str) or not key.strip():
+                    raise bad("every folder for the decider needs a name")
+                if key in cats:
+                    raise bad(f"two folders for the decider are called {key!r}")
+                cats[key] = {"path": c.get("path", ""), "desc": c.get("desc", "")}
+            out["categories"] = cats
+        else:
+            raise bad(f"unknown section {sec}")
+    return out
+
+
+def changed_settings(cfg: dict) -> dict:
+    """Only what differs from the defaults (category order counts: the decider reads them in order)."""
+    def same(a, b):  # == but 1 isn't 1.0 or True
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return type(a) is type(b) and a == b
+
+    out = {}
+    for sec, v in cfg.items():
+        d = DEFAULTS.get(sec)
+        if sec == "categories":
+            if not (isinstance(v, dict) and list(v) == list(d) and same(v, d)):
+                out[sec] = v
+        elif sec not in REPLACE_WHOLESALE and isinstance(v, dict) and isinstance(d, dict):
+            diff = {k: x for k, x in v.items() if k not in d or not same(x, d[k])}
+            if diff:
+                out[sec] = diff
+        elif not same(v, d):
+            out[sec] = v
+    return out
+
+
+def _current(state_dir: Path, explicit: str | None) -> tuple[Path, Path | None, bytes | None]:
+    """(where settings are saved, the file they're read from now, its bytes)."""
+    target = settings_path(state_dir, explicit)
+    source = target if target.is_file() else (None if explicit else find_config(state_dir, None))
+    return target, source, source.read_bytes() if source else None
+
+
+def _checked(text: str, path: Path) -> dict:
+    from .rules import compile_rules  # a bad regex is a config error too
+
+    cfg = _merge(DEFAULTS, _parse(text, path))
+    check_types(cfg)
+    validate(cfg)
+    compile_rules(cfg)
+    return cfg
+
+
+def _sha(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def read_settings(state_dir: Path, explicit: str | None = None) -> dict:
+    """The folder's settings, merged with the defaults. A file dewey can't use comes back with
+    valid=false, the error and its text, so the app can show it instead of failing."""
+    target, source, data = _current(state_dir, explicit)
+    out = {"path": str(target), "exists": target.is_file(), "source": str(source) if source else None,
+           "sha256": _sha(target), "valid": True, "error": None, "raw": None,
+           "config": to_app(DEFAULTS), "defaults": to_app(DEFAULTS)}
+    if source is not None:
+        raw = data.decode("utf-8", errors="replace")
+        try:
+            out["config"] = to_app(_checked(raw, source))
+        except DeweyExit as e:
+            out.update(valid=False, error=str(e.code), raw=raw, config=None)
+    return out
+
+
+def write_settings(state_dir: Path, explicit: str | None, data, *, reset: bool = False,
+                   expect_sha: str | None = None) -> dict:
+    """Save the app's settings (any subset of sections) over the current ones, or over the defaults
+    with reset. Checked like a file dewey reads, written atomically, the old file kept as .bak."""
+    target, source, current = _current(state_dir, explicit)
+    if target.is_symlink():  # a dotfiles link: write where it points, keep the link
+        target = target.resolve()
+    if expect_sha is not None and (_sha(target) or "none") != expect_sha:
+        raise DeweyExit(f"{target} changed since the settings were read; showing the new version", STALE)
+    base = DEFAULTS
+    if not reset and source is not None:
+        try:
+            base = _checked(current.decode("utf-8", errors="replace"), source)
+        except DeweyExit as e:
+            raise DeweyExit(f"{e.code}\nFix the file, or start over from the defaults "
+                            "(the old file is kept as dewey.toml.bak).", CONFIG) from None
+    cfg = _merge(base, from_app(data))
+    check_types(cfg)
+    validate(cfg)
+    from .rules import compile_rules
+    compile_rules(cfg)
+    try:
+        body = dumps(changed_settings(cfg))
+    except (TypeError, ValueError) as e:
+        raise DeweyExit(f"settings: {e}", CONFIG) from None
+    text = SETTINGS_HEADER + ("\n" + body if body else "")
+    if to_app(_checked(text, target)) != to_app(cfg):  # the writer must give back exactly what it was given
+        raise RuntimeError("the TOML writer didn't round-trip these settings; nothing was written")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if target.exists():
+        backup = target.with_name(target.name + ".bak")
+        shutil.copy2(target, backup)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return {**read_settings(state_dir, explicit), "backup": str(backup) if backup else None,
+            "changed": list(changed_settings(cfg))}

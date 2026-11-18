@@ -13,6 +13,7 @@
 For the Mac app (every command also takes --json: one JSON event per line on stdout):
   dewey rows   ROOT          the plan's rows with your CSV edits applied, as apply will see them
   dewey edit   ROOT          save edits (a JSON list on stdin) into the plan CSV
+  dewey config ROOT          this folder's settings; --write saves new ones (JSON on stdin)
   dewey app-info             version and app protocol
 """
 from __future__ import annotations
@@ -26,7 +27,7 @@ from contextlib import closing
 from pathlib import Path
 
 from . import __version__, catalog, config, decide, extract, mover, planner, progress
-from .errors import BAD_EDIT, NO_CATALOG, NOT_A_FOLDER, DeweyExit
+from .errors import BAD_EDIT, CONFIG, NO_CATALOG, NOT_A_FOLDER, DeweyExit
 from .progress import emit, human_bytes, say
 
 PROTOCOL = 1  # bump when an event or result shape changes in a way the app must know about
@@ -151,6 +152,35 @@ def cmd_edit(args):
     return res
 
 
+def cmd_config(args):
+    # Not _ctx: that refuses a broken dewey.toml, and this is how the app shows one and repairs it.
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        raise DeweyExit(f"not a folder: {root}", NOT_A_FOLDER)
+    state = config.state_dir_for(root, args.state)
+    if args.write:
+        try:
+            data = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            raise DeweyExit(f"settings on stdin aren't valid JSON: {e}", CONFIG) from None
+        res = config.write_settings(state, args.config, data, reset=args.reset, expect_sha=args.expect_sha)
+        say(f"Saved {res['path']}" + (f" (the previous version is {Path(res['backup']).name})" if res["backup"] else ""))
+        return res
+    res = config.read_settings(state, args.config)
+    if not res["valid"]:
+        if progress.json_mode():  # the app shows the error and the file
+            return res
+        raise DeweyExit(res["error"], CONFIG)
+    src = res["source"]
+    say(f"config: {src} (this folder's own file)" if res["exists"] else
+        f"config: {src} (saving writes {res['path']})" if src else
+        f"config: built-in defaults (`dewey init {args.root}` writes a file to edit)")
+    changed = config.changed_settings(config._merge(config.DEFAULTS, config.from_app(res["config"])))
+    say("Settings that differ from the defaults:\n" + config.dumps(changed) if changed else
+        "Every setting is the default.")
+    return res
+
+
 def cmd_app_info(args):
     info = {"version": __version__, "protocol": PROTOCOL, "python": sys.version.split()[0],
             "executable": sys.executable}
@@ -271,6 +301,11 @@ def _parser() -> argparse.ArgumentParser:
     p = add("edit", cmd_edit, "save edits (JSON list on stdin) into the plan CSV (for the Mac app)")
     p.add_argument("--plan", type=int, help="plan id (default: latest)")
     p.add_argument("--expect-sha", help="refuse if the CSV's sha256 isn't this (it changed since it was read)")
+    p = add("config", cmd_config, "this folder's settings; --write saves new ones (for the Mac app)")
+    p.add_argument("--write", action="store_true", help="save settings from JSON on stdin (only what differs "
+                   "from the defaults is written; the old file is kept as dewey.toml.bak)")
+    p.add_argument("--reset", action="store_true", help="with --write: start from the defaults, not the current file")
+    p.add_argument("--expect-sha", help="with --write: refuse if dewey.toml's sha256 isn't this ('none': no file)")
     add("app-info", cmd_app_info, "version and app protocol (for the Mac app)", root=False)
     return ap
 

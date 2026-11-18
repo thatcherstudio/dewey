@@ -15,6 +15,9 @@ struct OverviewView: View {
                            text: "\(folder.displayPath) isn't there. Plug in its disk, or remove it from the sidebar.")
                 } else if let error = folder.statusError {
                     Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: error) {
+                        if folder.statusErrorCode == "config" {
+                            Button("Open Settings") { folder.tab = .settings }
+                        }
                         Button("Try Again") { Task { await folder.refresh() } }
                     }
                 }

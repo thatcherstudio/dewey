@@ -4,6 +4,7 @@ import SwiftUI
 /// `dewey status` as cards, with the Scan & Plan button.
 struct OverviewView: View {
     let folder: FolderModel
+    @State private var confirmNewPlan = false
 
     var body: some View {
         ScrollView {
@@ -19,7 +20,7 @@ struct OverviewView: View {
                 }
                 if let status = folder.status {
                     if status.catalog {
-                        StatusCards(status: status)
+                        StatusCards(status: status, review: { folder.openReview() })
                         if !status.errors.isEmpty, let scan = status.scan {
                             ScanErrorsView(errors: status.errors, total: scan.errors ?? status.errors.count)
                         }
@@ -49,10 +50,21 @@ struct OverviewView: View {
                 HStack {
                     Button("Show in Finder") { folder.showInFinder() }
                         .controlSize(.large)
-                    Button("Scan & Plan") { folder.scanAndPlan() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .disabled(!folder.exists)
+                    Button("Scan & Plan") {
+                        if folder.hasUnsavedChanges { confirmNewPlan = true } else { folder.scanAndPlan() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!folder.exists)
+                    .confirmationDialog("Make a new plan and drop your unsaved changes?", isPresented: $confirmNewPlan) {
+                        Button("Discard Changes and Scan", role: .destructive) {
+                            folder.review?.discardChanges()
+                            folder.scanAndPlan()
+                        }
+                        Button("Review Changes") { folder.openReview() }
+                    } message: {
+                        Text("You changed rows of the current plan in Review and didn't save. A new plan replaces it.")
+                    }
                 }
                 Text("Reads every file. Nothing moves.")
                     .font(.caption)
@@ -78,6 +90,7 @@ struct OverviewView: View {
 
 struct StatusCards: View {
     let status: FolderStatus
+    var review: () -> Void = {}
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 16, alignment: .top)], alignment: .leading,
@@ -140,6 +153,7 @@ struct StatusCards: View {
                 }
                 .font(.caption).foregroundStyle(.secondary)
                 HStack {
+                    Button("Review", action: review).buttonStyle(.borderedProminent)
                     Button("Open CSV") { FolderModel.open(plan.csv) }.disabled(plan.csv == nil)
                     Button("Report") { FolderModel.open(plan.report) }.disabled(plan.report == nil)
                 }

@@ -194,6 +194,11 @@ final class AppModel {
         }
     }
 
+    /// Folders whose plan has changes made in Review and not saved.
+    var foldersWithUnsavedChanges: [FolderModel] {
+        folders.paths.compactMap { folderModels[$0] }.filter(\.hasUnsavedChanges)
+    }
+
     /// App quit: SIGINT every running dewey, like Ctrl-C (it saves what's done and exits on its own).
     func cancelAllRuns() {
         for f in busyFolders { f.session?.cancel() }

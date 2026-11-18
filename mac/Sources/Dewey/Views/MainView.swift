@@ -123,6 +123,8 @@ struct FolderRow: View {
             Spacer(minLength: 4)
             if folder.isRunning {
                 ProgressView().controlSize(.small)
+            } else if folder.hasUnsavedChanges {
+                Circle().fill(.blue).frame(width: 7, height: 7).help("Unsaved changes to the plan")
             }
         }
         .help(folder.exists ? folder.displayPath : "\(folder.displayPath) isn't there any more")
@@ -157,20 +159,34 @@ struct NoFolderView: View {
     }
 }
 
-/// One folder: its overview, or its Scan & Plan run while there is one.
+/// One folder: its Scan & Plan run while there is one, otherwise the Overview or Review tab.
 struct FolderDetail: View {
-    let folder: FolderModel
+    @Bindable var folder: FolderModel
 
     var body: some View {
         Group {
             if let session = folder.session {
                 RunView(folder: folder, session: session)
             } else {
-                OverviewView(folder: folder)
+                switch folder.tab {
+                case .overview: OverviewView(folder: folder)
+                case .review: ReviewTab(folder: folder)
+                }
             }
         }
         .navigationTitle(folder.name)
         .navigationSubtitle(folder.parentPath)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("View", selection: $folder.tab) {
+                    ForEach(FolderModel.Tab.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(folder.session != nil)
+                .help(folder.session != nil ? "Finish or close Scan & Plan first" : "")
+            }
+        }
         .task { await folder.refresh() }
     }
 }

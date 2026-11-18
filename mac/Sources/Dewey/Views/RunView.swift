@@ -143,9 +143,16 @@ struct RunView: View {
                 }
                 Spacer()
                 Button("Scan Again") { session.restart() }
-                Button("Done") { folder.dismissRun() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
+                if case .finished = session.state {
+                    Button("Done") { folder.dismissRun() }
+                    Button("Review Plan") { folder.openReview() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Done") { folder.dismissRun() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .controlSize(.large)
@@ -266,7 +273,7 @@ struct PlanOutcome: View {
                     .foregroundStyle(.secondary)
             }
             Notice(systemImage: "hand.raised", tint: .blue,
-                   text: "Nothing has moved yet. Look over the plan (Open Plan CSV), then apply it.")
+                   text: "Nothing has moved yet. Review the plan: approve, reject or redirect rows, then apply it.")
         }
     }
 

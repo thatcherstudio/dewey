@@ -11,7 +11,7 @@ struct DeweyApp: App {
                 .environment(delegate.model)
                 .frame(minWidth: 780, minHeight: 520)
         }
-        .defaultSize(width: 1040, height: 720)
+        .defaultSize(width: 1240, height: 780)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Add Folder…") { delegate.model.chooseFolders() }
@@ -37,6 +37,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A scan in progress is safe to stop (it keeps what's done), but say so before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let unsaved = model.foldersWithUnsavedChanges
+        if !unsaved.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Quit without saving your changes to the plan?"
+            alert.informativeText = "Review has unsaved changes for "
+                + unsaved.map(\.name).joined(separator: ", ") + ". Quitting drops them; the plan stays as it was."
+            alert.addButton(withTitle: "Keep Reviewing")
+            alert.addButton(withTitle: "Quit Anyway")
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                if let f = unsaved.first { model.selection = .folder(f.path); f.openReview() }
+                return .terminateCancel
+            }
+        }
         let busy = model.busyFolders
         guard !busy.isEmpty else { return .terminateNow }
         let alert = NSAlert()

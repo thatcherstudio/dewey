@@ -56,6 +56,57 @@ dewey undo   ~/Downloads              # reverses the last batch
 Re-running `dewey scan` only re-hashes files whose size or mtime changed, and files dewey moved
 keep their hashes. Re-running `dewey plan` reuses cached decisions for files whose details haven't changed.
 
+## Mac app
+
+Dewey.app does the same steps in windows: add a folder, Scan & Plan with live progress, review the
+plan in a table, preview and apply it, undo any batch, and edit the folder's settings. It runs the
+`dewey` you installed above and never writes dewey's files itself: every change goes through a
+dewey command. It starts and stops `laya-serve` for you. You build it yourself; it isn't signed or
+notarized.
+
+You need macOS 14 or later and Xcode 16 or later. The Command Line Tools are enough:
+`xcode-select --install`.
+
+1. Do steps 1 and 2 of the quick start. The app finds `~/.venvs/dewey` and `~/.venvs/laya` on its
+   own, and starts `laya-serve` itself, so skip that line.
+2. Build it and open it:
+
+   ```bash
+   cd dewey
+   make run        # builds build/Dewey.app (under a minute), then opens it
+   ```
+
+3. Optional: keep it with your other apps with `ditto build/Dewey.app /Applications/Dewey.app`.
+
+Dewey starts Laya as it opens; the light in the toolbar turns green when the model is ready (click
+it to stop or start Laya). Then **Add Folder…** (⌘O) and **Scan & Plan**. If it can't find `dewey`
+or `laya-serve`, it opens on **Setup** instead, with the command that installs the missing one and a
+Copy button.
+
+| Tab | What it does | dewey underneath |
+|---|---|---|
+| Overview | Files, size, duplicates, the last plan and batches; **Scan & Plan** | `status`, `run` |
+| Review | The plan as a table: approve, reject, change the folder, Quick Look (Space). **Save** writes `plan-N.csv` | `rows`, `edit` |
+| Apply | Every row that will move and every row that won't (with why), then **Move** | `apply --dry-run`, `apply` |
+| History | Every batch; **Undo** puts one back | `undo` |
+| Settings | Folders for the model, rules, thresholds, folder kinds, the model. **Save** writes `.dewey/dewey.toml` | `config` |
+
+Things worth knowing:
+
+- **Privacy prompts.** macOS asks once per folder before Dewey reads Desktop, Documents, Downloads
+  or an external disk. A rebuilt app may ask again, because each build is signed ad hoc on your Mac.
+  No Full Disk Access is needed.
+- **Settings saves only what differs from dewey's defaults**, so later improvements to the
+  defaults still reach you. Saving rewrites `dewey.toml` without your comments; the previous file is
+  kept as `dewey.toml.bak`. `dewey config ROOT` prints the same settings in Terminal.
+- **Dewey > Settings… (⌘,)** holds app preferences: where `dewey` and `laya-serve` are (empty = found
+  automatically in `~/.venvs/*/bin`, `~/.local/bin`, Homebrew, then your shell's `PATH`), the model's
+  URL, and whether Laya starts when Dewey opens.
+- **Quitting** stops the `laya-serve` the app started. A move in progress stops after the file in
+  hand, and History can undo what moved.
+- **To start over**, `defaults delete io.github.thatcherstudio.dewey` forgets the folder list and
+  preferences. Each folder's `.dewey/` stays.
+
 ## Choosing a decider
 
 | `--backend` | What | Confidence | Speed (rough) | Notes |
@@ -175,7 +226,14 @@ I haven't verified that format.
 
 ```bash
 python -m unittest discover -s tests -v     # fake Laya + fake chat servers; full scan→plan→apply→undo
+make test                                   # the same, then the Mac app's Swift tests
 ```
+
+The Mac app is a SwiftPM package in `mac/`: `DeweyCore` (running dewey, decoding its events, the
+models behind each tab; all tested) and `Dewey` (SwiftUI). It drives dewey through `--json`: one JSON
+event per line on stdout, ending in exactly one `result`, `error` (with a `code`) or `interrupted`
+event; Cancel is SIGINT. `make app` runs `scripts/build-app.sh`; `swift scripts/make-icon.swift`
+redraws the icon.
 
 Design notes: skip-dirs match directories only and are configurable; symlinks are never followed
 (no cycles, no paths escaping the root); files that disappear are marked `missing` in this root's

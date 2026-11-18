@@ -17,12 +17,18 @@ struct DeweyApp: App {
                 Button("Add Folder…") { delegate.model.chooseFolders() }
                     .keyboardShortcut("o")
             }
+            CommandGroup(replacing: .help) {
+                Button("Dewey Help") { NSWorkspace.shared.open(Self.help) }
+            }
         }
         Settings {
             PreferencesView()
                 .environment(delegate.model)
         }
     }
+
+    /// The README's Mac app section.
+    static let help = URL(string: "https://github.com/thatcherstudio/dewey#mac-app")!
 }
 
 @MainActor

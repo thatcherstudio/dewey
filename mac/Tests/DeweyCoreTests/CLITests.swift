@@ -120,10 +120,11 @@ struct CLITests {
     }
 }
 
-/// The real dewey from this Mac's venv, when there is one: proves protocol 1 decodes for real.
 /// The dewey the README installs, for tests that run the real thing (skipped without it).
+/// DEWEY_TEST_DEWEY picks another one: `make test-app` runs these against the app's own copy.
 let realDewey: URL? = {
-    let url = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".venvs/dewey/bin/dewey")
+    let url = ProcessInfo.processInfo.environment["DEWEY_TEST_DEWEY"].map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".venvs/dewey/bin/dewey")
     return ToolLocator.isExecutable(url) ? url : nil
 }()
 

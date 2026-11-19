@@ -15,6 +15,13 @@ enum Prefs {
     }
 }
 
+/// The tools inside the app: build-app.sh puts dewey (with its own Python) in Contents/Resources/bin.
+enum Bundled {
+    static let tools = Bundle.main.resourceURL?.appending(path: "bin")
+
+    static func contains(_ url: URL) -> Bool { url.path.hasPrefix(Bundle.main.bundlePath + "/") }
+}
+
 /// The dewey checkout this app was built from: …/mac/Sources/Dewey/AppModel.swift, four levels up.
 /// The setup screen uses it to show install commands with the real path in them.
 enum RepoPath {
@@ -101,7 +108,7 @@ final class AppModel {
         let d = UserDefaults.standard
         let deweyPref = d.string(forKey: Prefs.deweyPath) ?? ""
         let layaPref = d.string(forKey: Prefs.layaServePath) ?? ""
-        let locator = ToolLocator()
+        let locator = ToolLocator(bundledDir: Bundled.tools)
         async let foundDewey = locator.locate(.dewey, preferred: deweyPref)
         async let foundLaya = locator.locate(.layaServe, preferred: layaPref)
 
@@ -112,10 +119,13 @@ final class AppModel {
                 let info = try await DeweyCLI(executable: url).appInfo()
                 appInfo = info
                 if info.protocolVersion == AppInfo.supportedProtocol {
-                    dewey = .ok("dewey \(info.version), Python \(info.python)\n\(url.path)")
+                    dewey = .ok("dewey \(info.version), Python \(info.python)\n"
+                                + (Bundled.contains(url) ? "inside Dewey.app" : url.path))
                 } else {
                     dewey = .problem("\(url.path) speaks app protocol \(info.protocolVersion); this app needs "
-                                     + "\(AppInfo.supportedProtocol). Reinstall dewey from the checkout this app was built from.")
+                                     + "\(AppInfo.supportedProtocol). "
+                                     + (deweyPref.isEmpty ? "Reinstall dewey from the checkout this app was built from."
+                                        : "Clear the dewey path in Dewey > Settings… to use the dewey inside the app."))
                 }
             } catch {
                 dewey = .problem("Found \(url.path), but it didn't answer `dewey app-info`. A dewey from before the "
@@ -123,7 +133,8 @@ final class AppModel {
             }
         } else {
             dewey = .problem(deweyPref.isEmpty
-                             ? "dewey isn't in ~/.venvs/dewey, ~/.local/bin, Homebrew, or your shell's PATH."
+                             ? "This Dewey has no dewey inside it (build it with `make app`), and there's none in "
+                               + "~/.venvs/dewey, ~/.local/bin, Homebrew, or your shell's PATH."
                              : "The dewey path in Settings (\(deweyPref)) isn't an executable file.")
         }
 

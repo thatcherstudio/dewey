@@ -51,6 +51,20 @@ struct ToolLocatorTests {
         #expect(await locator.locate(.dewey, preferred: "  ") == home.appending(path: ".venvs/dewey/bin/dewey"))
     }
 
+    @Test func theAppsOwnCopyComesFirst() async throws {
+        let home = try tempDir()
+        let venv = home.appending(path: ".venvs/dewey/bin/dewey")
+        try makeFile(venv, executable: true)
+        let laya = home.appending(path: ".venvs/laya/bin/laya-serve")
+        try makeFile(laya, executable: true)
+        let bundled = home.appending(path: "Dewey.app/Contents/Resources/bin")
+        try makeFile(bundled.appending(path: "dewey"), executable: true)
+        let locator = ToolLocator(home: home, systemDirs: [], bundledDir: bundled, useLoginShell: false)
+        #expect(await locator.locate(.dewey) == bundled.appending(path: "dewey"))
+        #expect(await locator.locate(.layaServe) == laya, "laya-serve isn't in the app")
+        #expect(await locator.locate(.dewey, preferred: venv.path) == venv, "a chosen path still wins")
+    }
+
     @Test func installCommandsQuoteTheRepoPath() {
         let cmd = SetupCommands.installDewey(repo: URL(fileURLWithPath: "/Users/x/My Projects/dewey"))
         #expect(cmd.contains("-e '/Users/x/My Projects/dewey[all]'"))

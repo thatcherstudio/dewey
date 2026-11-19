@@ -13,24 +13,28 @@ public enum Tool: String, Sendable, CaseIterable {
     }
 }
 
-/// Finds `dewey` and `laya-serve`. Apps opened from Finder get a bare PATH, so this checks the
-/// places the README installs them before asking the person's login shell.
+/// Finds `dewey` and `laya-serve`: the app's own copy first, then the places the README installs
+/// them, then the person's login shell (apps opened from Finder get a bare PATH).
 public struct ToolLocator: Sendable {
     public var home: URL
     public var systemDirs: [URL]
+    /// Tools inside the app (Dewey.app/Contents/Resources/bin, where build-app.sh puts dewey).
+    public var bundledDir: URL?
     public var useLoginShell: Bool
 
     public init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
                 systemDirs: [URL] = [URL(fileURLWithPath: "/opt/homebrew/bin"), URL(fileURLWithPath: "/usr/local/bin")],
-                useLoginShell: Bool = true) {
+                bundledDir: URL? = nil, useLoginShell: Bool = true) {
         self.home = home
         self.systemDirs = systemDirs
+        self.bundledDir = bundledDir
         self.useLoginShell = useLoginShell
     }
 
     public func candidates(for tool: Tool) -> [URL] {
-        [home.appending(path: ".venvs/\(tool.venv)/bin/\(tool.rawValue)"),
-         home.appending(path: ".local/bin/\(tool.rawValue)")]
+        (bundledDir.map { [$0.appending(path: tool.rawValue)] } ?? [])
+            + [home.appending(path: ".venvs/\(tool.venv)/bin/\(tool.rawValue)"),
+               home.appending(path: ".local/bin/\(tool.rawValue)")]
             + systemDirs.map { $0.appending(path: tool.rawValue) }
     }
 

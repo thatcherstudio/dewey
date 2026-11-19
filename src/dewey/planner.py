@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import decide as dmod
 from . import folders as fkind
-from .catalog import UNIT_KINDS, now_iso
+from .catalog import UNIT_KINDS, check_safe_root, left_alone, now_iso
 from .errors import DECIDER, NO_CATALOG, DeweyExit
 from .progress import Progress, human_bytes, say
 from .rules import compile_rules, file_date, fill, first_match
@@ -36,6 +36,12 @@ AVOID_KEEP = re.compile(r"(^|/)(Downloads|Desktop|tmp|temp|Temp|Inbox)(/|$)")
 def norm_key(p: str) -> str:
     """APFS/HFS+ are case-insensitive and normalization-insensitive by default."""
     return unicodedata.normalize("NFC", p).casefold()
+
+
+def plan_files(state_dir: Path, plan_id: int) -> tuple[Path, Path]:
+    """A plan's CSV and report: fixed names in the state folder, so a folder that was renamed, copied
+    or mounted somewhere else still finds its own. (`plans.csv_path` is where they were that day.)"""
+    return state_dir / f"plan-{plan_id}.csv", state_dir / f"report-{plan_id}.md"
 
 
 def build_state(f) -> dict:
@@ -126,11 +132,14 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
     p = cfg["plan"]
     review = p["review_dir"].strip("/")
     dest_root = Path(p["dest"]).expanduser().resolve() if p["dest"] else root
+    check_safe_root(root)
     scan = conn.execute("SELECT * FROM scans WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     if not scan:
         raise DeweyExit("no completed scan yet; run `dewey scan` first", NO_CATALOG)
     algo = (conn.execute("SELECT hash_algo FROM files WHERE hash_algo IS NOT NULL LIMIT 1").fetchone() or ["hash"])[0]
-    files = conn.execute("SELECT * FROM files WHERE missing=0").fetchall()
+    hidden_too = bool(cfg["scan"].get("include_hidden", False))
+    files = [f for f in conn.execute("SELECT * FROM files WHERE missing=0")  # a scan from before 0.2.1 kept these
+             if not left_alone(f["rel_path"], hidden_too)]
     regular = [f for f in files if f["kind"] == "file" and f["hash"]]
     unreadable = [f for f in files if f["kind"] == "file" and not f["hash"]]
     units = [f for f in files if f["kind"] in UNIT_KINDS]
@@ -265,8 +274,8 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
             r["reason"] += f"; renamed to avoid a name clash"
 
     # 6. persist ------------------------------------------------------------------
-    cur = conn.execute("INSERT INTO plans (created, scan_id, dest_root, decider) VALUES (?,?,?,?)",
-                       (now_iso(), scan["id"], str(dest_root), decider.name))
+    cur = conn.execute("INSERT INTO plans (created, scan_id, dest_root, decider, root) VALUES (?,?,?,?,?)",
+                       (now_iso(), scan["id"], str(dest_root), decider.name, str(root)))
     plan_id = cur.lastrowid
     for i, r in enumerate(rows, 1):
         r["row"] = i
@@ -275,7 +284,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
                      (plan_id, i, f["id"], f["hash"], f["size"], f["rel_path"], r["dst"], r["action"],
                       r["status"], r["category"], r["decided_by"], r["confidence"], r["reason"],
                       r["alternatives"], json.dumps(r["state"], ensure_ascii=False)))
-    csv_path = state_dir / f"plan-{plan_id}.csv"
+    csv_path, report_path = plan_files(state_dir, plan_id)
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:  # BOM: Excel then reads it as UTF-8
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         w.writeheader()
@@ -288,7 +297,6 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
                rows=rows, dup_groups=dup_groups, units=units, symlinks=symlinks, unreadable=unreadable, cloud=cloud,
                counts=counts, n_files=len(regular), review=review, whole=whole, max_depth=max_depth,
                folders=folder_info)
-    report_path = state_dir / f"report-{plan_id}.md"
     report_path.write_text(render_report(ctx), encoding="utf-8")
     summary = summarize(rows)
     conn.execute("UPDATE plans SET csv_path=?, report_path=?, summary=? WHERE id=?",
@@ -333,7 +341,9 @@ def _plan_folders(cfg: dict, root: Path, review: str, max_depth: int, whole: dic
             info.append(dict(path=prefix, kind="filing", why="dewey files things here", n=n_files, bytes=size, row=None))
             continue
         inner = [u for u in units if u["rel_path"].startswith(prefix + "/")]
-        kind, why = fkind.classify(name, members, inner, marker)
+        # hidden files aren't in the catalog, so the two that say "code" are looked for on disk
+        git = [m for m in (".github", ".gitignore") if os.path.lexists(root / prefix / m)]
+        kind, why = fkind.classify(name, members, inner, marker, git_files=git)
         home = homes.get(kind, "") if may_move else ""
         row = None
         if home:

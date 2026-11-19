@@ -8,6 +8,10 @@ At the end a pretty <batch>.json is written with what moved, where, and why.
 Safety: never overwrites (hard-link + unlink, or check-then-rename where hard links aren't
 supported), re-hashes a file if it changed since the scan, copies and verifies the hash
 before deleting the source when crossing volumes, and never deletes anything else.
+
+Paths: a plan and a journal belong to the folder, not to where the folder was that day. Both keep
+paths relative to it, so a folder that was renamed, copied or mounted under another name applies
+and undoes inside itself. Only a plan.dest outside the folder stays where it was.
 """
 from __future__ import annotations
 
@@ -24,10 +28,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
+from . import macos
 from .catalog import hash_file, now_iso
 from .errors import BAD_EDIT, NO_PLAN, NOTHING_TO_UNDO, STALE, DeweyExit
-from .planner import CSV_FIELDS, DECIDER_PREFIXES, norm_key
+from .planner import CSV_FIELDS, DECIDER_PREFIXES, norm_key, plan_files
 from .progress import Progress, human_bytes, say
+
+try:
+    import fcntl
+except ImportError:  # not a Unix: plain fsync it is
+    fcntl = None
 
 PRUNABLE = {".DS_Store"}
 
@@ -68,6 +78,25 @@ def _noclobber_rename(src: Path, dst: Path) -> None:
         raise
 
 
+def _sync(path) -> None:
+    """Push a file or folder all the way to the disk. On macOS fsync stops at the drive's own cache,
+    which an unplugged drive loses; F_FULLFSYNC doesn't. A filesystem that can do neither is left be."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except (AttributeError, OSError):  # not macOS, or not on this filesystem
+            pass
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            if e.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+    finally:
+        os.close(fd)
+
+
 def move_file(src: Path, dst: Path, expected_hash: str | None, algo: str | None) -> str:
     try:
         _noclobber_rename(src, dst)
@@ -78,13 +107,19 @@ def move_file(src: Path, dst: Path, expected_hash: str | None, algo: str | None)
     tmp = dst.with_name(dst.name + ".dewey-partial")
     try:  # the copy itself is inside: a full disk or Ctrl-C mid-copy must not leave a partial behind
         shutil.copy2(src, tmp)
+        macos.keep_metadata(src, tmp)  # Finder tags, "where from", creation date: copy2 drops them
         if expected_hash and algo and hash_file(str(tmp), algo) != expected_hash:
             raise RuntimeError("copy verification failed (hash mismatch); source left untouched")
+        _sync(tmp)  # on the disk, not in a cache, before the only other copy is deleted
         _noclobber_rename(tmp, dst)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
     try:
+        try:
+            _sync(dst.parent)  # its name too, where the disk can do that; the bytes are already safe
+        except OSError:
+            pass
         os.unlink(src)
     except BaseException:
         dst.unlink(missing_ok=True)  # our verified copy; the source is still intact
@@ -117,6 +152,48 @@ def _free(dst: Path, reserved: set[str], keep_ext: bool = True) -> Path:
 def _safe_rel(p: str) -> bool:
     pp = PurePosixPath(p)
     return bool(p) and not pp.is_absolute() and ".." not in pp.parts and not p.startswith("~")
+
+
+def _is_rel(p) -> bool:
+    """A path dewey itself recorded relative to a folder: text, not absolute, never climbing out."""
+    return isinstance(p, str) and bool(p) and not PurePosixPath(p).is_absolute() and ".." not in PurePosixPath(p).parts
+
+
+def _same_folder(a: Path, b: Path) -> bool:
+    try:
+        return a == b or os.path.samefile(a, b)  # ~/downloads and ~/Downloads are one folder on a Mac
+    except OSError:  # one of them isn't there any more
+        return False
+
+
+def _moved_with(path: Path, was: Path, now: Path) -> Path:
+    """`path` as it is now that the folder once at `was` is at `now`. A path that was never inside
+    that folder (a plan.dest on another disk) is where it always was."""
+    if was == now:
+        return path
+    if path == was:
+        return now
+    try:
+        return now / path.relative_to(was)
+    except ValueError:
+        return path
+
+
+def plan_root(conn, plan) -> Path | None:
+    """The folder a plan was made for, as it was called that day."""
+    was = plan["root"]
+    if not was:  # a plan from before 0.2.1: the root its scan recorded
+        row = conn.execute("SELECT root FROM scans WHERE id=?", (plan["scan_id"],)).fetchone()
+        was = row["root"] if row else None
+    return Path(was) if was else None
+
+
+def plan_dest(conn, plan, root: Path) -> Path:
+    """Where a plan files things for the folder as it is now: inside `root` when it was inside the
+    folder the plan was made for, wherever that folder has gone since."""
+    was = plan_root(conn, plan)
+    dest = Path(plan["dest_root"])
+    return _moved_with(dest, was, root) if was else dest
 
 
 def _label_for(dst: str, category: str, cats: dict) -> str | None:
@@ -216,8 +293,11 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
           prune_empty: bool = False) -> dict:
     plan = _latest_plan(conn, plan_id)
     pid = plan["id"]
-    dest_root = Path(plan["dest_root"])
-    csv_path = Path(csv_path or plan["csv_path"])
+    dest_root = plan_dest(conn, plan, root)
+    csv_path = Path(csv_path) if csv_path else plan_files(state_dir, pid)[0]
+    was = plan_root(conn, plan)
+    if was and not _same_folder(was, root):
+        say(f"note: plan {pid} was made when this folder was at {was}. It is applied here, in {root}.")
     cats = cfg["categories"]
     homes = _homes(cfg)
     db_rows = {r["row"]: r for r in conn.execute("SELECT * FROM plan_rows WHERE plan_id=?", (pid,))}
@@ -506,18 +586,31 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
                 except json.JSONDecodeError:
                     pass  # a torn final line from a crash: ignore it
     moves = [r for r in recs if r.get("op") == "move"]
-    mkdirs = [r["path"] for r in recs if r.get("op") == "mkdir"]
+    # The journal names both ends relative to the folder and to where it filed things, so they are
+    # found again in a folder that was renamed, copied or mounted somewhere else since.
+    head = next((r for r in recs if r.get("op") == "batch"), {})
+    was_root = Path(head["root"]) if head.get("root") else root
+    dest_root = _moved_with(Path(head["dest_root"]), was_root, root) if head.get("dest_root") else root
+    if not _same_folder(was_root, root):
+        say(f"note: batch {batch} moved things when this folder was at {was_root}. It is undone here, in {root}.")
+    mkdirs = [d for d in (_moved_with(Path(r["path"]), was_root, root) for r in recs
+                          if r.get("op") == "mkdir" and isinstance(r.get("path"), str))
+              if dest_root in d.parents]  # apply only ever made folders inside the destination
     uj = Journal(state_dir / "moves" / f"{batch}.undo.jsonl")
-    uj.write({"op": "undo", "batch": batch, "started": now_iso()})
+    uj.write({"op": "undo", "batch": batch, "root": str(root), "dest_root": str(dest_root), "started": now_iso()})
     restored, skipped = 0, []
     prog = Progress("Undoing", total=len(moves), total_bytes=sum(m.get("size", 0) for m in moves) or None)
     for rec in reversed(moves):
-        src, dst = Path(rec["from"]), Path(rec["to"])
         size = rec.get("size", 0)
         is_dir = rec.get("kind") == "folder"
+        if not (_is_rel(rec.get("from_rel")) and _is_rel(rec.get("to_rel"))):
+            skipped.append((str(rec.get("to") or rec.get("to_rel") or "?"), "the journal doesn't say where this was"))
+            prog.update(1, size)
+            continue
+        src, dst = root / rec["from_rel"], dest_root / rec["to_rel"]
         if not os.path.lexists(dst):
             if not os.path.lexists(src):
-                skipped.append((rec, f"{'folder' if is_dir else 'file'} is at neither location"))
+                skipped.append((str(dst), f"{'folder' if is_dir else 'file'} is at neither location"))
             else:  # never moved, or already put back by an undo that was interrupted: done either way
                 if is_dir:
                     _repoint_tree(conn, root, dst, src)
@@ -528,19 +621,19 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
             prog.update(1, size)
             continue
         if os.path.lexists(src):
-            skipped.append((rec, "something now exists at the original path"))
+            skipped.append((str(dst), "something now exists at the original path"))
             prog.update(1, size)
             continue
         if is_dir:  # the folder goes back as one piece, whatever is in it now: nothing inside is lost
             if not stat.S_ISDIR(os.lstat(dst).st_mode):
-                skipped.append((rec, "no longer a folder; left where it is"))
+                skipped.append((str(dst), "no longer a folder; left where it is"))
                 prog.update(1, size)
                 continue
             src.parent.mkdir(parents=True, exist_ok=True)
             try:
                 move_dir(dst, src)
             except Exception as ex:  # noqa: BLE001
-                skipped.append((rec, f"{type(ex).__name__}: {ex}"))
+                skipped.append((str(dst), f"{type(ex).__name__}: {ex}"))
                 prog.update(1, size)
                 continue
             uj.write({"op": "restore", "row": rec["row"], "from": str(dst), "to": str(src), "at": now_iso()})
@@ -553,14 +646,14 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
         st = os.lstat(dst)
         if st.st_size != size or (st.st_mtime_ns != rec.get("mtime_ns") and rec.get("algo")
                                   and hash_file(str(dst), rec["algo"]) != rec["hash"]):
-            skipped.append((rec, "file was modified after the move; left where it is"))
+            skipped.append((str(dst), "file was modified after the move; left where it is"))
             prog.update(1, size)
             continue
         src.parent.mkdir(parents=True, exist_ok=True)
         try:
             move_file(dst, src, rec.get("hash"), rec.get("algo"))
         except Exception as ex:  # noqa: BLE001
-            skipped.append((rec, f"{type(ex).__name__}: {ex}"))
+            skipped.append((str(dst), f"{type(ex).__name__}: {ex}"))
             prog.update(1, size)
             continue
         uj.write({"op": "restore", "row": rec["row"], "from": str(dst), "to": str(src), "at": now_iso()})
@@ -571,7 +664,7 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
         prog.update(1, size)
     prog.done()
     removed = 0
-    for d in sorted(mkdirs, key=lambda p: -len(Path(p).parts)):
+    for d in sorted(mkdirs, key=lambda p: -len(p.parts)):
         if _remove_if_empty(d):  # left alone if something else lives there now
             removed += 1
     conn.execute("DELETE FROM labels WHERE batch=?", (batch,))
@@ -580,10 +673,10 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     uj.close()
     conn.commit()
     say(f"Undo {batch}: restored {restored:,}, skipped {len(skipped)}, removed {removed} folders it had created")
-    for rec, why in skipped[:10]:
-        say(f"  ! {rec['to']}: {why}")
+    for path, why in skipped[:10]:
+        say(f"  ! {path}: {why}")
     return dict(batch=batch, restored=restored, skipped=len(skipped), dirs_removed=removed,
-                skipped_items=[{"path": rec["to"], "why": why} for rec, why in skipped])
+                skipped_items=[{"path": path, "why": why} for path, why in skipped])
 
 
 def export_labels(conn: sqlite3.Connection, cfg: dict, out: Path, include_rejected: bool = False) -> int:
@@ -609,12 +702,12 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, plan_id: int | None = None) -> dict:
+def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan_id: int | None = None) -> dict:
     """Every row of a plan as apply would see it now: the plan's values, the CSV's edits, the verdict."""
     plan = _latest_plan(conn, plan_id)
     pid = plan["id"]
-    dest_root = Path(plan["dest_root"])
-    csv_path = Path(plan["csv_path"])
+    dest_root = plan_dest(conn, plan, root)
+    csv_path, report_path = plan_files(state_dir, pid)
     data, _, csv_rows = read_plan_csv(csv_path)
     edits = edits_by_row(csv_rows)
     cats, homes = cfg["categories"], _homes(cfg)
@@ -633,7 +726,8 @@ def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, plan_id: int | No
                      "alternatives": r["alternatives"]})
     p = cfg["plan"]
     return {"plan_id": pid, "created": plan["created"], "decider": plan["decider"], "root": str(root),
-            "dest_root": str(dest_root), "csv": str(csv_path), "report": plan["report_path"],
+            "dest_root": str(dest_root), "csv": str(csv_path),
+            "report": str(report_path) if report_path.exists() else None,
             "csv_sha256": _sha256(data), "summary": json.loads(plan["summary"] or "{}"),
             "categories": [{"key": k, "path": v.get("path", ""), "desc": v.get("desc", "")} for k, v in cats.items()],
             "folder_kinds": [{"kind": k, "path": v} for k, v in homes.items()],
@@ -668,14 +762,15 @@ def _check_edits(edits, db_rows: dict, pid: int) -> list[dict]:
     return edits
 
 
-def edit_plan(conn: sqlite3.Connection, edits, plan_id: int | None = None, expect_sha: str | None = None) -> dict:
+def edit_plan(conn: sqlite3.Connection, state_dir: Path, edits, plan_id: int | None = None,
+              expect_sha: str | None = None) -> dict:
     """Write edits into plan-N.csv as a person would in Numbers. Every other line and column stays as it was.
 
     All or nothing: one bad edit, or a file that changed since `expect_sha` was read, leaves it untouched.
     """
     plan = _latest_plan(conn, plan_id)
     pid = plan["id"]
-    csv_path = Path(plan["csv_path"])
+    csv_path = plan_files(state_dir, pid)[0]
     data, fields, csv_rows = read_plan_csv(csv_path)
     if expect_sha and expect_sha != _sha256(data):
         raise DeweyExit(f"{csv_path.name} changed since it was read (saved from Numbers?); reload it and try again",

@@ -41,10 +41,12 @@ BUILD_FILES = {"install.sh", "build.sh", "setup.sh", "makefile", "justfile", "pa
 GITHUB_ZIP = re.compile(r"-(main|master|develop|trunk)$", re.I)
 
 
-def classify(name: str, files: list, units: list, own_marker: str | None = None) -> tuple[str, str]:
+def classify(name: str, files: list, units: list, own_marker: str | None = None,
+             git_files: list | None = None) -> tuple[str, str]:
     """-> (kind, why). files: catalog rows inside the folder; units: bundles/projects inside it.
 
     own_marker: the project marker when the folder itself is a project unit.
+    git_files: .github / .gitignore found at the top of the folder (hidden, so not in `files`).
     """
     rel = lambda f: f["rel_path"].casefold()
     exts = Counter(f["ext"] for f in files)
@@ -64,7 +66,7 @@ def classify(name: str, files: list, units: list, own_marker: str | None = None)
         return "code", f"project inside ({inner[0]['name']})"
     if xcode:
         return "code", f"Xcode project ({xcode[0]['name']}){readme}"
-    if any("/.github/" in rel(f) or "/.gitignore" in rel(f) for f in files):
+    if git_files or any("/.github/" in rel(f) or "/.gitignore" in rel(f) for f in files):
         return "code", f".github / .gitignore, {top(CODE_EXT) or 'source files'}"
     cad_src = [e for e in exts if e in CAD_SOURCE]
     if cad_src or (share(CAD_ANY) >= 0.25 and exts.keys() & CAD_ANY):

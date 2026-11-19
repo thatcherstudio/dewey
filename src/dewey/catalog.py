@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import extract
-from .errors import CONFIG, DeweyExit
+from .config import STATE_DIRNAME
+from .errors import CONFIG, UNSAFE_ROOT, DeweyExit
 from .progress import Progress, human_bytes, say
 
 SCHEMA = """
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS decision_cache (
   decided_by TEXT, note TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, created TEXT, scan_id INTEGER, dest_root TEXT,
-  decider TEXT, csv_path TEXT, report_path TEXT, summary TEXT);
+  decider TEXT, csv_path TEXT, report_path TEXT, summary TEXT,
+  root TEXT);                      -- the folder that day; dest_root follows it if it has moved since
 CREATE TABLE IF NOT EXISTS plan_rows (
   plan_id INTEGER, row INTEGER, file_id INTEGER, hash TEXT, size INTEGER,
   src TEXT, dst TEXT, action TEXT, status TEXT, category TEXT, decided_by TEXT,
@@ -62,10 +64,23 @@ CREATE TABLE IF NOT EXISTS labels (
 
 UNIT_KINDS = ("bundle", "project")
 SF_DATALESS = 0x40000000  # macOS: iCloud/File Provider placeholder whose bytes aren't on disk
+UF_HIDDEN = 0x00008000    # macOS: hidden in Finder without a dot (~/Library is)
+PARTIAL_SUFFIX = ".dewey-partial"  # a copy to another disk, until it is verified
 
 
 def _is_dataless(st) -> bool:
     return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
+def _is_hidden(name: str, st) -> bool:
+    return name.startswith(".") or bool(getattr(st, "st_flags", 0) & UF_HIDDEN)
+
+
+def left_alone(rel_path: str, include_hidden: bool) -> bool:
+    """A catalog path the planner never touches, whatever an older scan recorded: another folder's
+    .dewey, and (unless scan.include_hidden) anything hidden or inside something hidden."""
+    parts = rel_path.split("/")
+    return STATE_DIRNAME in parts or (not include_hidden and any(p.startswith(".") for p in parts))
 
 
 def now_iso() -> str:
@@ -79,7 +94,47 @@ def open_db(state_dir: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    if "root" not in {c["name"] for c in conn.execute("PRAGMA table_info(plans)")}:  # a catalog from before 0.2.1
+        conn.execute("ALTER TABLE plans ADD COLUMN root TEXT")
+        conn.commit()
     return conn
+
+
+# Folders dewey won't organize: moving things around in them breaks the system or other people's files.
+SYSTEM_TREES = ("/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/etc", "/dev",
+                "/proc", "/sys", "/boot")                       # these and everything inside them
+SYSTEM_FOLDERS = ("/private", "/var", "/tmp", "/opt", "/Volumes")  # these themselves; folders inside are fine
+CLOUD_FOLDERS = ("Mobile Documents", "CloudStorage")  # in ~/Library: iCloud Drive, Dropbox, Google Drive…
+
+
+def unsafe_root(root: Path) -> str | None:
+    """Why `root` (resolved) is no folder to organize, or None when it is fine."""
+    real = lambda p: Path(os.path.realpath(p))
+    if root == Path(root.anchor):
+        return "it is the whole disk"
+    try:
+        home = Path.home().resolve()
+    except RuntimeError:  # an account without a home folder: only the system's folders to mind
+        home = None
+    if home and root in home.parents:
+        return "it holds your whole home folder, and everyone else's"
+    lib = home / "Library" if home else None
+    if lib and (root == lib or lib in root.parents):
+        inside = root.relative_to(lib).parts
+        if not (len(inside) >= 2 and inside[0] in CLOUD_FOLDERS):  # ~/Library/CloudStorage/Dropbox is fine
+            return "it is in your Library, where apps keep their own files"
+    if any(root == t or t in root.parents for t in map(real, SYSTEM_TREES)):
+        return "it belongs to the system"
+    if any(root == t for t in map(real, SYSTEM_FOLDERS)):
+        return "it belongs to the system"
+    return None
+
+
+def check_safe_root(root: Path) -> None:
+    why = unsafe_root(root)
+    if why:
+        raise DeweyExit(f"dewey won't organize {root}: {why}. Pick a folder of your own files instead.",
+                        UNSAFE_ROOT)
 
 
 def check_root(conn: sqlite3.Connection, root: Path) -> None:
@@ -141,10 +196,14 @@ def walk(root: Path, cfg: dict, state_dir: Path, errors: list):
 
     skip_dirs only matches directories (not same-named files) and comes from config;
     symlinks are recorded rather than followed (no cycles, no paths escaping the root).
+    Hidden files and folders (a leading dot, or hidden in Finder) are passed over unless
+    scan.include_hidden: they are settings and app data, not a mess to file. A folder named .dewey
+    is another folder's catalog and is passed over always.
     """
     sc = cfg["scan"]
-    skip = set(sc["skip_dirs"])
+    skip = set(sc["skip_dirs"]) | {STATE_DIRNAME}
     ignore = set(sc["ignore_files"])
+    hidden_too = bool(sc.get("include_hidden", False))
     bundles = tuple(s.lower() for s in sc["bundle_suffixes"])
     markers = tuple(sc["project_markers"])
     hash_cloud = bool(sc.get("hash_cloud_files", False))
@@ -163,15 +222,20 @@ def walk(root: Path, cfg: dict, state_dir: Path, errors: list):
             for e in it:
                 try:
                     if e.is_symlink():
+                        st = e.stat(follow_symlinks=False)
+                        if not hidden_too and _is_hidden(e.name, st):
+                            continue
                         try:
                             target = os.readlink(e.path)
                         except OSError:
                             target = None
-                        yield "symlink", e.path, e.stat(follow_symlinks=False), target
+                        yield "symlink", e.path, st, target
                     elif e.is_dir(follow_symlinks=False):
                         if e.name in skip or os.path.realpath(e.path) == state_real:
                             continue
                         st = e.stat(follow_symlinks=False)
+                        if not hidden_too and _is_hidden(e.name, st):
+                            continue
                         key = (st.st_dev, st.st_ino)
                         if key in seen:
                             continue
@@ -183,8 +247,10 @@ def walk(root: Path, cfg: dict, state_dir: Path, errors: list):
                         else:
                             stack.append(e.path)
                     elif e.is_file(follow_symlinks=False):
-                        if e.name not in ignore:
+                        if e.name not in ignore and not e.name.endswith(PARTIAL_SUFFIX):
                             st = e.stat(follow_symlinks=False)
+                            if not hidden_too and _is_hidden(e.name, st):
+                                continue
                             yield ("cloud" if not hash_cloud and _is_dataless(st) else "file"), e.path, st, None
                 except OSError as ex:
                     errors.append((os.path.relpath(e.path, root), f"{type(ex).__name__}: {ex.strerror or ex}"))
@@ -228,6 +294,7 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
             raise DeweyExit("scan.hash = 'blake3' but the blake3 package isn't installed (pip install blake3)", CONFIG)
     elif algo not in hashlib.algorithms_available:
         raise DeweyExit(f"unknown hash algorithm: {algo}", CONFIG)
+    check_safe_root(root)
     check_root(conn, root)
     cur = conn.execute("INSERT INTO scans (started, root) VALUES (?, ?)", (now_iso(), str(root)))
     scan_id = cur.lastrowid

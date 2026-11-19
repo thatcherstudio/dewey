@@ -109,6 +109,7 @@ def cmd_run(args):
 
 def cmd_apply(args):
     root, state, cfg, _ = _ctx(args)
+    catalog.check_safe_root(root)
     with closing(catalog.open_db(state)) as conn:
         return mover.apply(conn, root, cfg, state, plan_id=args.plan, csv_path=args.csv,
                            include_review=args.include_review, dry_run=args.dry_run, prune_empty=args.prune_empty)
@@ -133,7 +134,7 @@ def cmd_rows(args):
     root, state, cfg, _ = _ctx(args)
     _need_catalog(state, args.root)
     with closing(catalog.open_db(state)) as conn:
-        res = mover.plan_rows(conn, root, cfg, args.plan)
+        res = mover.plan_rows(conn, root, cfg, state, args.plan)
     say(f"Plan {res['plan_id']}: {len(res['rows']):,} rows, "
         f"{sum(r['edited'] for r in res['rows']):,} edited since the plan was made")
     return res
@@ -147,7 +148,7 @@ def cmd_edit(args):
     except json.JSONDecodeError as e:
         raise DeweyExit(f"edits on stdin aren't valid JSON: {e}", BAD_EDIT) from None
     with closing(catalog.open_db(state)) as conn:
-        res = mover.edit_plan(conn, edits, args.plan, args.expect_sha)
+        res = mover.edit_plan(conn, state, edits, args.plan, args.expect_sha)
     say(f"Saved {res['changed']:,} changed rows to {res['csv']}")
     return res
 
@@ -198,8 +199,10 @@ def status_data(conn, root: Path, state: Path) -> dict:
     top = [{"ext": r["ext"], "n": r["n"], "bytes": r["b"] or 0} for r in conn.execute(
         "SELECT ext, COUNT(*) n, SUM(size) b FROM files WHERE kind='file' AND missing=0 "
         "GROUP BY ext ORDER BY b DESC LIMIT 8")]
-    plans = [{"id": p["id"], "created": p["created"], "decider": p["decider"], "csv": p["csv_path"],
-              "report": p["report_path"], "summary": json.loads(p["summary"] or "{}")}
+    there = lambda p: str(p) if p.exists() else None  # where they are now, not where the plan was made
+    plans = [{"id": p["id"], "created": p["created"], "decider": p["decider"],
+              "csv": there(planner.plan_files(state, p["id"])[0]),
+              "report": there(planner.plan_files(state, p["id"])[1]), "summary": json.loads(p["summary"] or "{}")}
              for p in conn.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 20")]
     batches = [{"batch": b["batch"], "moves": b["n"], "undone": b["u"] or 0, "plan_id": b["plan_id"],
                 "moved_at": b["moved_at"], "folders": b["f"] or 0}

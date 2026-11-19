@@ -7,6 +7,7 @@ from __future__ import annotations
 
 # The kinds the app may react to. Anything raised without one is "error".
 NOT_A_FOLDER = "not_a_folder"
+UNSAFE_ROOT = "unsafe_root"
 NO_CATALOG = "no_catalog"
 NO_PLAN = "no_plan"
 NOTHING_TO_UNDO = "nothing_to_undo"

@@ -238,12 +238,52 @@ final class AppModel {
         add(panel.urls)
     }
 
-    /// Adds folders (files are ignored) and selects the first one.
+    /// Adds folders (files are ignored) and selects the first one. A folder dewey won't organize (the
+    /// disk, the Library, a system folder) is turned down with the reason; the home folder asks first.
     func add(_ urls: [URL]) {
         let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        var fine: [URL] = [], ask: [(URL, String)] = [], refused: [(String, String)] = []
+        for url in dirs {
+            let path = FolderStore.normalize(url)
+            switch folders.paths.contains(path) ? .ok : RootCheck.check(path) {  // one already listed was answered before
+            case .ok: fine.append(url)
+            case .confirm(let why): ask.append((url, why))
+            case .refuse(let why): refused.append((path, why))
+            }
+        }
+        addChecked(fine)
+        guard !ask.isEmpty || !refused.isEmpty else { return }
+        Task { @MainActor in  // after the drop or the open panel has finished: an alert inside a drop stalls it
+            addChecked(ask.filter { Self.confirmAdding($0.0, why: $0.1) }.map(\.0))
+            if !refused.isEmpty { Self.explainRefused(refused) }
+        }
+    }
+
+    private func addChecked(_ urls: [URL]) {
         var first: String?
-        for url in dirs.reversed() { first = folders.add(url) }  // reversed: they end up in the order chosen
+        for url in urls.reversed() { first = folders.add(url) }  // reversed: they end up in the order chosen
         if let first { selection = .folder(first) }
+    }
+
+    private static func confirmAdding(_ url: URL, why: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Organize your whole home folder?"
+        alert.informativeText = why
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Add Home Folder")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private static func explainRefused(_ refused: [(path: String, why: String)]) {
+        let alert = NSAlert()
+        let name = { (p: String) in p == "/" ? "the whole disk" : "“\((p as NSString).lastPathComponent)”" }
+        alert.messageText = refused.count == 1 ? "Dewey won't organize \(name(refused[0].path))"
+            : "Dewey won't organize \(refused.count) of these folders"
+        alert.informativeText = (refused.count == 1 ? [refused[0].why]
+                                 : refused.map { "\(($0.path as NSString).abbreviatingWithTildeInPath): \($0.why)" })
+            .joined(separator: "\n") + "\nAdd a folder of your own files instead."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     func removeFolder(_ path: String) {

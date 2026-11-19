@@ -9,6 +9,8 @@ hash_cloud_files = false # iCloud "Optimize Mac Storage" placeholders: reading t
                          # false = catalog them but don't read, hash or move them.
 snippet_chars = 400      # text preview sent to the decider. Laya's context is 512 tokens and the
                          # folder descriptions share it, so keep this short.
+include_hidden = false   # hidden files and folders (a leading dot, or hidden in Finder) are settings
+                         # and app data: left alone, never cataloged. true = treat them like any file.
 skip_dirs = [".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".Trash",
              ".Trashes", ".Spotlight-V100", ".fseventsd", ".TemporaryItems",
              ".DocumentRevisions-V100", ".cache"]

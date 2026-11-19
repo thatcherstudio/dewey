@@ -129,3 +129,37 @@ struct FolderStoreTests {
         #expect(s.paths == ["/a", "/b", "/c"])
     }
 }
+
+struct RootCheckTests {
+    private func check(_ path: String) -> RootCheck { RootCheck.check(path, home: "/Users/someone") }
+
+    private func refused(_ path: String) -> Bool {
+        if case .refuse = check(path) { return true }
+        return false
+    }
+
+    @Test func systemFoldersTheLibraryAndAnythingHoldingHomeAreRefused() {
+        for p in ["/", "/Users", "/Users/someone/Library", "/Users/someone/Library/Application Support/App",
+                  "/Users/someone/Library/Mobile Documents", "/Users/someone/Library/CloudStorage",
+                  "/System/Library", "/Library/Fonts", "/Applications", "/usr/local/bin", "/private/etc",
+                  "/private/tmp", "/private/var", "/Volumes"] {
+            #expect(refused(p), "\(p)")
+        }
+    }
+
+    @Test func ordinaryFoldersCloudDrivesAndOtherDisksAreFine() {
+        for p in ["/Users/someone/Downloads", "/Users/someone/Documents/Library",
+                  "/Users/someone/Library/Mobile Documents/com~apple~CloudDocs",
+                  "/Users/someone/Library/CloudStorage/Dropbox/Scans", "/Volumes/Backup", "/Volumes/Backup/Photos",
+                  "/Users/Shared/Scans", "/private/tmp/scratch"] {
+            #expect(check(p) == .ok, "\(p)")
+        }
+    }
+
+    @Test func theHomeFolderAsksFirst() {
+        guard case .confirm = check("/Users/someone") else {
+            Issue.record("the home folder should ask before it is added")
+            return
+        }
+    }
+}

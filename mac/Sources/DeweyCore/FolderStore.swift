@@ -18,7 +18,7 @@ public final class FolderStore {
     /// The form dewey itself uses for a root (`Path.resolve()`): absolute, symlinks resolved, so
     /// /tmp/x and /private/tmp/x are one folder.
     /// (Not `resolvingSymlinksInPath()`: that strips /private, the opposite of what dewey does.)
-    public static func normalize(_ url: URL) -> String {
+    public nonisolated static func normalize(_ url: URL) -> String {
         var p = url.standardizedFileURL.path
         if let real = realpath(p, nil) {  // nil for a path that doesn't exist: keep it as given
             p = String(cString: real)

@@ -190,7 +190,9 @@ refused (never mis-moved).
   case- and Unicode-insensitively like APFS.
 - **Changed since the scan?** If size or mtime differ from the catalog, dewey re-hashes the file and
   skips it on a mismatch.
-- **Across volumes** (`--dest /Volumes/…`): copy, verify the hash, and only then remove the source.
+- **Across volumes** (`--dest /Volumes/…`): copy, verify the hash, flush the copy to the disk, and
+  only then remove the source. Finder tags, "where from" and the creation date go with the file
+  (and come back with undo).
 - **Folders stay whole by default.** Only loose files in the top folder are planned
   (`max_depth = 0`); nothing is pulled out of a subfolder, not even a duplicate (when a loose file
   duplicates one inside a folder, the loose copy goes to review). `max_depth = -1` files everything
@@ -209,6 +211,17 @@ refused (never mis-moved).
 - **Never touched:** symlinks (recorded, not followed: no cycles, nothing outside the root),
   iCloud "Optimize Storage" placeholders (cataloged but not read, so a scan doesn't download your
   iCloud Drive), and `.DS_Store`.
+- **Hidden files are left alone.** Anything whose name starts with a dot, or that Finder hides, is
+  settings or app data: it is never cataloged, planned or moved, and neither is anything inside a
+  hidden folder. A hidden file inside a folder that moves whole travels with it.
+  `include_hidden = true` under `[scan]` treats them like any other file. Another folder's `.dewey`
+  is skipped either way.
+- **Not every folder.** dewey refuses the whole disk, a folder that holds your home folder, your
+  Library (except the iCloud Drive and cloud-storage folders in it) and the system's folders. The
+  app asks before it adds your whole home folder.
+- **The folder can move.** Plans and journals keep paths relative to the folder, so after you rename
+  it, copy it, or plug its drive in under another name, `apply` and `undo` work inside the folder
+  you name. Only a `dest` outside the folder stays where it was.
 - **Undo** restores files to their exact original paths, skips any file that was modified after the
   move, and removes the folders the batch created (a lone `.DS_Store` from Finder counts as empty).
 

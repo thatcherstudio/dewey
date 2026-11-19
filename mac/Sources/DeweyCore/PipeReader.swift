@@ -48,7 +48,12 @@ enum PipeReader {
     }
 
     /// Write `data` and close, off the cooperative pool (a big write blocks until the child reads it).
+    ///
+    /// A child that exits before reading it all (dewey stopping on a broken dewey.toml) closes the pipe
+    /// under the write. By default that is SIGPIPE, which ends the whole app; F_SETNOSIGPIPE makes it
+    /// an error on this one write instead, and the child's own error event says what went wrong.
     static func write(_ data: Data?, to handle: FileHandle) {
+        _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
         DispatchQueue.global(qos: .userInitiated).async {
             if let data { try? handle.write(contentsOf: data) }
             try? handle.close()

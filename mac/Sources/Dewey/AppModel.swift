@@ -92,7 +92,7 @@ final class AppModel {
 
     init() {
         Prefs.register()
-        laya = LayaController(baseURL: Self.layaBaseURL())
+        laya = LayaController(baseURL: Self.layaBaseURL(), record: Self.layaLayout().serverRecord)
         installer = LayaInstaller(layout: Self.layaLayout())
         selection = SidebarItem(storageKey: UserDefaults.standard.string(forKey: Prefs.selection))
             .flatMap { item in
@@ -113,6 +113,7 @@ final class AppModel {
     }
 
     func launch() async {
+        await laya.stopLeftover()  // a laya-serve the last Dewey didn't get to stop (a crash, Force Quit)
         await checkAll()
         if UserDefaults.standard.bool(forKey: Prefs.startLayaOnLaunch), deweyReady, layaServeURL != nil {
             await startLaya()

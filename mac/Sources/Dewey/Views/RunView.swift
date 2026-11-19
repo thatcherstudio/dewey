@@ -92,10 +92,15 @@ struct RunView: View {
     @ViewBuilder
     private func failure(_ step: ScanPlanSession.Step, _ error: DeweyError) -> some View {
         let layaCanStart: Bool = {
-            guard model.layaServeURL != nil, !model.laya.isRunning else { return false }
+            guard folder.usesAppLaya, model.layaServeURL != nil, !model.laya.isRunning else { return false }
             if case .ready = model.laya.status { return false }
             return true
         }()
+        // The folder's own settings name another server: starting the app's Laya wouldn't help.
+        let elsewhere: String? = switch folder.modelSource {
+        case .otherLaya(let place), .chat(let place): place
+        default: nil
+        }
         VStack(alignment: .leading, spacing: 12) {
             if let question = session.remoteServerQuestion {
                 Notice(systemImage: "network", tint: .orange,
@@ -106,6 +111,16 @@ struct RunView: View {
                         .help("Dewey remembers this for this folder and this server.")
                     Button("Plan with Rules Only") { session.retryPlan(rulesOnly: true) }
                         .help("Plan with your rules and duplicates; nothing leaves this Mac.")
+                }
+            } else if session.needsModel, let elsewhere {
+                Notice(systemImage: "brain", tint: .orange,
+                       text: "The scan is done, but the model at \(elsewhere) didn't answer, so no plan was made. "
+                             + "This folder's settings name that server, not the Laya this app runs. Try again "
+                             + "once it is up, or plan with your rules only.")
+                HStack {
+                    Button("Try Again") { session.retryPlan(rulesOnly: false) }
+                    Button("Plan with Rules Only") { session.retryPlan(rulesOnly: true) }
+                        .help("Plan with your rules and duplicates; files the rules don't cover stay where they are.")
                 }
             } else if session.needsModel {
                 Notice(systemImage: "brain", tint: .orange,
@@ -143,8 +158,9 @@ struct RunView: View {
             if session.isActive {
                 Text("Nothing moves during Scan & Plan.").foregroundStyle(.secondary)
                 Spacer()
-                Button("Cancel") { session.cancel() }
+                Button(session.isStopping ? "Stopping…" : "Cancel") { session.cancel() }
                     .keyboardShortcut(".", modifiers: .command)
+                    .disabled(session.isStopping)
                     .help("Stop after the file in hand (⌘.). Work done so far is kept.")
             } else {
                 if case .finished = session.state, let plan = session.plan {

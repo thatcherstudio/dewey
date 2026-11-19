@@ -36,6 +36,8 @@ public final class ScanPlanSession {
     /// Called once each time the session stops being active (finished, failed or stopped).
     @ObservationIgnored public var onEnd: (@MainActor (ScanPlanSession) -> Void)?
 
+    private var cancelRequested = false
+
     @ObservationIgnored private let cli: DeweyCLI
     @ObservationIgnored private let modelLoading: @MainActor () -> Bool
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -90,14 +92,23 @@ public final class ScanPlanSession {
         launch(scanFirst: true, rulesOnly: false)
     }
 
+    /// Cancel was pressed and dewey hasn't stopped yet. It stops after the item in hand; one that is
+    /// stuck is ended a few seconds later (`DeweyRun.cancel`).
+    public var isStopping: Bool { cancelRequested && isActive }
+
     /// Like Ctrl-C: dewey stops after the item in hand and keeps everything done so far.
-    public func cancel() { task?.cancel() }
+    public func cancel() {
+        guard isActive else { return }
+        cancelRequested = true
+        task?.cancel()
+    }
 
     /// Wait for the current run to end (for tests and for quitting).
     public func wait() async { await task?.value }
 
     private func launch(scanFirst: Bool, rulesOnly: Bool, allowRemote: Bool = false) {
         self.rulesOnly = rulesOnly
+        cancelRequested = false
         endedAt = nil
         startedAt = .now
         state = .running(scanFirst ? .scan : .plan)

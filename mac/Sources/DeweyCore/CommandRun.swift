@@ -18,6 +18,7 @@ public final class CommandRun<Value: Decodable & Sendable> {
     public private(set) var progress: RunProgress
     public private(set) var startedAt = Date()
     public private(set) var endedAt: Date?
+    private var cancelRequested = false
     /// Called once, when the run ends (finished, failed or stopped).
     @ObservationIgnored public var onEnd: (@MainActor (CommandRun<Value>) -> Void)?
 
@@ -42,13 +43,27 @@ public final class CommandRun<Value: Decodable & Sendable> {
         return nil
     }
 
+    /// A move that dewey turned down because the plan changed after its preview was made
+    /// (`apply --expect-sha`). Nothing moved; the preview has to be looked at again.
+    public var planChanged: Bool {
+        if case .failed(.failed(code: "stale", message: _)) = state { return true }
+        return false
+    }
+
     public func start() {
         guard task == nil else { return }
         startedAt = .now
         task = Task { await self.perform() }
     }
 
-    public func cancel() { task?.cancel() }
+    /// Cancel was pressed and dewey is finishing the file in hand.
+    public var isStopping: Bool { cancelRequested && isActive }
+
+    public func cancel() {
+        guard isActive else { return }
+        cancelRequested = true
+        task?.cancel()
+    }
 
     /// Wait for the run to end (for tests and for quitting).
     public func wait() async { await task?.value }

@@ -361,9 +361,17 @@ def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Res
     return Resolution(status, dst, category, "move")
 
 
+def _selection_sha(pid: int, dest_root: Path, selected: list) -> str:
+    """One fingerprint of what an apply would move: which rows, from where, to where. A dry run gives
+    it out; `--expect-sha` on the real run then moves only if nothing changed in between (the CSV
+    saved again from Numbers, a setting, a link in the folder)."""
+    moves = [[r["row"], r["src"], dst] for r, _status, dst, _category in selected]
+    return _sha256(json.dumps([pid, str(dest_root), moves]).encode())
+
+
 def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan_id: int | None = None,
           csv_path: str | None = None, include_review: bool = False, dry_run: bool = False,
-          prune_empty: bool = False) -> dict:
+          prune_empty: bool = False, expect_sha: str | None = None) -> dict:
     plan = _latest_plan(conn, plan_id)
     pid = plan["id"]
     dest_root = plan_dest(conn, plan, root)
@@ -407,6 +415,12 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
             continue
         selected.append((r, res.status, res.dst, res.category))
     refused_items = [{"row": r["row"], "src": r["src"], "why": why} for r, why in refused]
+    sha = _selection_sha(pid, dest_root, selected)
+    if expect_sha:
+        want = expect_sha.strip().lower()
+        if len(want) < 12 or not sha.startswith(want):  # a dry run prints the first 12 characters
+            raise DeweyExit(f"plan {pid} no longer moves what the dry run showed: its CSV, the settings or the "
+                            "folder changed since. Nothing moved. Look at a new dry run, then apply again.", STALE)
 
     total = sum(r["size"] or 0 for r, *_ in selected)
     n_dirs = sum(r["action"] == "folder" for r, *_ in selected)
@@ -422,8 +436,10 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
         if len(selected) > 40:
             say(f"  … {len(selected) - 40:,} more")
         say("Dry run: nothing moved.")
+        if selected:
+            say(f"  To move these only if nothing has changed since: add --expect-sha {sha[:12]}")
         return dict(plan_id=pid, dry_run=True, bytes=total, refused=refused_items,
-                    dest_root=str(dest_root), dest_outside=fence.outside,
+                    dest_root=str(dest_root), dest_outside=fence.outside, selection_sha256=sha,
                     selected=[{"row": r["row"], "src": r["src"], "dst": dst, "status": status, "category": category,
                                "action": r["action"], "reason": r["reason"], "size": r["size"] or 0}
                               for r, status, dst, category in selected])

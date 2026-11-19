@@ -152,6 +152,15 @@ class JsonInterface(unittest.TestCase):
         st = self.result("status", self.R)
         self.assertEqual(st["catalog"], False)
         self.assertFalse((self.state / "catalog.db").exists())        # reading status created nothing
+        # which model the folder's settings name, for the app to set beside the Laya it runs itself
+        self.assertEqual(st["decider"], {"backend": "systemone", "url": "http://127.0.0.1:8000", "model": "english"})
+        self.state.mkdir()
+        (self.state / "dewey.toml").write_text('[decider]\nbackend = "chat"\nurl = "http://127.0.0.1:8080"\nmodel = "qwen"\n')
+        self.assertEqual(self.result("status", self.R)["decider"],
+                         {"backend": "chat", "url": "http://127.0.0.1:8080", "model": "qwen"})
+        run("scan", self.R)
+        self.assertEqual(self.result("status", self.R)["decider"]["backend"], "chat")   # scanned folders say it too
+        shutil.rmtree(self.state)
         with self.assertRaises(SystemExit) as cm:                       # text mode: unchanged
             run("status", self.R)
         self.assertIn("no catalog yet", str(cm.exception.code))
@@ -242,6 +251,34 @@ class JsonInterface(unittest.TestCase):
         self.result("apply", self.R)
         self.assertTrue((self.root / "Notes" / "todo notes (2).md").exists())            # the approved row moved
         self.assertTrue((self.root / "setup.dmg").exists())                              # the skipped one stayed
+
+    def test_apply_moves_only_what_its_dry_run_showed(self):
+        run("scan", self.R)
+        run("plan", self.R, "--url", self.url)
+        before = snapshot(self.root)
+        dry = self.result("apply", self.R, "--dry-run")
+        sha = dry["selection_sha256"]
+        self.assertEqual(self.result("apply", self.R, "--dry-run")["selection_sha256"], sha)
+        with_review = self.result("apply", self.R, "--dry-run", "--include-review")
+        self.assertGreater(len(with_review["selected"]), len(dry["selected"]))
+        self.assertNotEqual(with_review["selection_sha256"], sha)                      # other moves, other sha
+        self.assertIn(f"--expect-sha {sha[:12]}", run("apply", self.R, "--dry-run"))   # a person copies this
+
+        # the CSV is saved again (Numbers, another window) between the preview and the move
+        first = dry["selected"][0]
+        self.result("edit", self.R, stdin=json.dumps([{"row": first["row"], "dst": "Somewhere Else/"}]))
+        stale = self.error("apply", self.R, "--expect-sha", sha)
+        self.assertEqual(stale["code"], "stale")
+        self.assertIn("Nothing moved", stale["message"])
+        self.assertEqual(self.error("apply", self.R, "--expect-sha", sha, "--include-review")["code"], "stale")
+        self.assertEqual(snapshot(self.root), before)
+        self.assertFalse((self.state / "moves").exists())                              # no batch was begun
+
+        new = self.result("apply", self.R, "--dry-run")
+        self.assertEqual(self.error("apply", self.R, "--expect-sha", new["selection_sha256"][:8])["code"], "stale")
+        applied = self.result("apply", self.R, "--expect-sha", new["selection_sha256"][:12])
+        self.assertEqual(applied["counts"]["moved"], len(new["selected"]))
+        self.assertTrue((self.root / "Somewhere Else" / Path(first["src"]).name).exists())
 
     def test_bad_or_stale_edits_leave_the_csv_alone(self):
         run("scan", self.R)
@@ -370,6 +407,58 @@ class JsonInterface(unittest.TestCase):
             srv.server_close()
         events = [json.loads(l) for l in lines + out.splitlines()]
         self.assertEqual((p.returncode, self.final(events)["event"]), (130, "interrupted"), err)
+
+    STUCK = """
+import sys, time
+from dewey import catalog, cli
+real = catalog._work
+def work(e, *a):
+    if e.name == "stuck.pdf":
+        time.sleep(60)  # a parser that never comes back
+    return real(e, *a)
+catalog._work = work
+cli.main()
+"""
+
+    def stop_a_stuck_scan(self, *flags) -> tuple[int, str, str, float]:
+        """`dewey scan` with one worker that hangs, sent SIGINT once the other files are hashed."""
+        write(self.root / "stuck.pdf", "%PDF-1.4 never read")
+        p = subprocess.Popen([sys.executable, "-c", self.STUCK, "scan", self.R, *flags],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env={**os.environ, "PYTHONPATH": str(SRC)})
+        try:
+            time.sleep(1.5)
+            t0 = time.monotonic()
+            p.send_signal(signal.SIGINT)
+            out, err = p.communicate(timeout=20)
+        finally:
+            p.kill()
+        return p.returncode, out, err, time.monotonic() - t0
+
+    def test_a_stuck_worker_doesnt_keep_a_stopped_scan_alive(self):
+        code, out, err, took = self.stop_a_stuck_scan("--json")
+        events = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual((code, self.final(events)["event"]), (130, "interrupted"), err)
+        self.assertLess(took, 5)  # not the minute the stuck worker has left
+        with sqlite3.connect(self.state / "catalog.db") as db:  # the others' hashes are kept
+            self.assertGreater(db.execute("SELECT COUNT(*) FROM files WHERE hash IS NOT NULL").fetchone()[0], 0)
+        self.assertGreater(self.result("scan", self.R)["reused"], 0)
+
+    def test_ctrl_c_in_a_terminal_doesnt_wait_for_a_stuck_worker_either(self):
+        code, out, err, took = self.stop_a_stuck_scan()
+        self.assertEqual((code, out), (130, ""))
+        self.assertIn("interrupted. Finished work is saved", err)
+        self.assertLess(took, 5)
+
+    def test_a_stopped_scan_lets_go_of_a_big_file_between_megabytes(self):
+        big = self.root / "big.bin"
+        big.write_bytes(os.urandom(3 << 20))
+        self.assertEqual(catalog.hash_file(str(big), "sha256"), hashlib.sha256(big.read_bytes()).hexdigest())
+        stop = threading.Event()
+        self.assertEqual(catalog.hash_file(str(big), "sha256", stop), hashlib.sha256(big.read_bytes()).hexdigest())
+        stop.set()
+        with self.assertRaises(catalog.Stopped):
+            catalog.hash_file(str(big), "sha256", stop)
 
     # --- text mode is untouched ----------------------------------------------------------------
 

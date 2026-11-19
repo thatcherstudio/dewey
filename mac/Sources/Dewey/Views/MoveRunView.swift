@@ -30,8 +30,9 @@ struct JobScreen<Value: Decodable & Sendable, Outcome: View, Actions: View>: Vie
                 if run.isActive {
                     Text(activeNote).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Cancel") { run.cancel() }
+                    Button(run.isStopping ? "Stopping…" : "Cancel") { run.cancel() }
                         .keyboardShortcut(".", modifiers: .command)
+                        .disabled(run.isStopping)
                         .help("Stop after the file in hand (⌘.).")
                 } else {
                     actions
@@ -81,9 +82,15 @@ struct MoveRunView: View {
                                               from: folder.status?.batches.first { $0.batch == batch }?.destOutside)
                 }
             }
-            Button("Done") { folder.dismissMoves() }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
+            if run.planChanged {
+                Button("Look at the New Preview") { folder.dismissToApply() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            } else {
+                Button("Done") { folder.dismissMoves() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
         }
         .confirmUndo($undoRequest, folder: folder)
     }
@@ -100,7 +107,7 @@ struct MoveRunView: View {
         switch run.state {
         case .running: "Moving files…"
         case .finished(let r): r.counts.moved == 0 ? "Nothing moved" : "Moved \(r.movedText)"
-        case .failed: "The move stopped"
+        case .failed: run.planChanged ? "Nothing moved: the plan changed" : "The move stopped"
         case .stopped: "Stopped"
         }
     }
@@ -139,7 +146,13 @@ struct MoveRunView: View {
                        ? "Stopped before anything moved."
                        : "Stopped. The files moved so far stay where they are now; Undo puts them back.")
         case .failed(let error):
-            Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: error.errorDescription ?? "\(error)")
+            if run.planChanged {
+                Notice(systemImage: "arrow.triangle.2.circlepath", tint: .orange,
+                       text: "The plan isn't what the preview showed any more: its CSV was saved again, or a setting "
+                             + "changed, after the preview was made. So nothing moved. The preview is up to date now.")
+            } else {
+                Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: error.errorDescription ?? "\(error)")
+            }
         }
     }
 }

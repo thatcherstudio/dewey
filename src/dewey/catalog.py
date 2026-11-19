@@ -10,6 +10,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -178,15 +179,25 @@ class Entry:
     link: str | None = None
 
 
-def hash_file(path: str, algo: str) -> str:
+class Stopped(Exception):
+    """A worker gave up on its file because the scan was stopped. Nobody reads this result."""
+
+
+def hash_file(path: str, algo: str, stop: threading.Event | None = None) -> str:
+    """`stop` is looked at between megabytes, so a stopped scan lets go of a 40 GB file at once."""
+    if algo == "blake3":
+        import blake3  # type: ignore
+        h = blake3.blake3()
+    else:
+        h = hashlib.new(algo)
+    buf = bytearray(1 << 20)
+    view = memoryview(buf)
     with open(path, "rb") as fh:
-        if algo == "blake3":
-            import blake3  # type: ignore
-            h = blake3.blake3()
-            while chunk := fh.read(1 << 20):
-                h.update(chunk)
-            return h.hexdigest()
-        return hashlib.file_digest(fh, algo).hexdigest()
+        while n := fh.readinto(buf):
+            if stop is not None and stop.is_set():
+                raise Stopped(path)
+            h.update(view[:n])
+    return h.hexdigest()
 
 
 def _is_bundle_dir(path: str) -> bool:
@@ -288,11 +299,13 @@ def _row(e: Entry, scan_id: int, h=None, algo=None, snip=None, pdate=None, cam=N
             h, algo, snip, pdate, cam, e.link, scan_id, scan_id, err)
 
 
-def _work(e: Entry, algo: str, limit: int):
+def _work(e: Entry, algo: str, limit: int, stop: threading.Event | None = None):
     try:
-        h = hash_file(e.abs, algo)
+        h = hash_file(e.abs, algo, stop)
     except OSError as ex:
         return e, None, None, None, None, f"{type(ex).__name__}: {ex.strerror or ex}"
+    if stop is not None and stop.is_set():
+        raise Stopped(e.abs)
     snip = extract.snippet(e.abs, e.ext, limit)
     pdate, cam = extract.photo_info(e.abs, e.ext)
     return e, h, snip, pdate, cam, None
@@ -367,11 +380,13 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
     prog = Progress("Hashing", total=len(todo), total_bytes=total_bytes or None)
     limit = int(sc["snippet_chars"])
     # Not `with ThreadPoolExecutor`: leaving that block waits for the whole queue, so Ctrl-C on a big
-    # folder kept hashing to the end. On any exit, queued files are dropped (only the ones in flight
-    # finish) and the hashes done so far are kept for the next scan.
+    # folder kept hashing to the end. On any exit, queued files are dropped, the ones in flight are
+    # told to stop (`stop`; cli.main doesn't wait for one that can't hear it, a parser that hangs),
+    # and the hashes done so far are kept for the next scan.
     pool = ThreadPoolExecutor(max_workers=max(1, int(sc["workers"])))
+    stop = threading.Event()
     try:
-        futures = [pool.submit(_work, e, algo, limit) for e in todo]
+        futures = [pool.submit(_work, e, algo, limit, stop) for e in todo]
         for i, fut in enumerate(as_completed(futures), 1):
             e, h, snip, pdate, cam, err = fut.result()
             conn.execute(UPSERT, _row(e, scan_id, h, algo if h else None, snip, pdate, cam, err))
@@ -381,6 +396,7 @@ def scan(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path) -> di
             if i % 1000 == 0:
                 conn.commit()
     except BaseException:
+        stop.set()
         pool.shutdown(wait=False, cancel_futures=True)
         conn.commit()
         raise

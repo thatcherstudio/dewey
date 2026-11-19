@@ -1,11 +1,39 @@
 import Foundation
 import Observation
 
+/// A process as the system knows it now: enough to tell it from another one that got the same pid.
+struct RunningProcess: Equatable, Sendable {
+    var startSec: Int
+    var startUsec: Int
+    var parent: Int32
+
+    /// nil when no process has this pid (or it has exited and only waits to be collected).
+    static func find(_ pid: Int32) -> RunningProcess? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard pid > 0, sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0, size > 0,
+              info.kp_proc.p_pid == pid, info.kp_proc.p_stat != UInt8(SZOMB) else { return nil }
+        let started = info.kp_proc.p_un.__p_starttime
+        return RunningProcess(startSec: Int(started.tv_sec), startUsec: Int(started.tv_usec), parent: info.kp_eproc.e_ppid)
+    }
+}
+
+/// The laya-serve a Dewey started, written down so the next launch can find it if this one never
+/// gets to stop it (a crash, Force Quit, the Mac's power). The start time makes the pid unmistakable.
+struct ServerRecord: Codable, Equatable, Sendable {
+    var pid: Int32
+    var startSec: Int
+    var startUsec: Int
+    var port: Int
+}
+
 /// Starts and stops `laya-serve`, the local decision model, and watches its `/health`.
 ///
 /// laya-serve loads the model before it starts listening, so "connection refused" while our process
 /// runs means "still loading". A server that was already running on the port is used as is and never
-/// stopped by the app, because the app didn't start it.
+/// stopped by the app, because the app didn't start it. The one exception is a server an earlier
+/// Dewey started and left behind: `stopLeftover()` ends that one at launch.
 @MainActor @Observable
 public final class LayaController {
     public struct Health: Equatable, Sendable {
@@ -40,10 +68,14 @@ public final class LayaController {
     private var process: Process?
     private var stopping = false
     private var pollTask: Task<Void, Never>?
+    private var leftoverNote: String?
+    /// Where the running server is written down (`ServerRecord`); nil keeps no record.
+    @ObservationIgnored private let record: URL?
 
-    public init(baseURL: URL = URL(string: "http://127.0.0.1:8000")!, model: String = "english") {
+    public init(baseURL: URL = URL(string: "http://127.0.0.1:8000")!, model: String = "english", record: URL? = nil) {
         self.baseURL = baseURL
         self.model = model
+        self.record = record
     }
 
     public var isRunning: Bool { process != nil }
@@ -85,8 +117,8 @@ public final class LayaController {
         p.standardError = pipe
         p.standardInput = FileHandle.nullDevice
         p.terminationHandler = { [weak self] proc in
-            let code = proc.terminationStatus
-            Task { @MainActor in self?.exited(code) }
+            let code = proc.terminationStatus, pid = proc.processIdentifier
+            Task { @MainActor in self?.exited(code, pid: pid) }
         }
         do {
             try p.run()
@@ -95,10 +127,12 @@ public final class LayaController {
             return
         }
         process = p
+        remember(p.processIdentifier)
         self.executable = executable
         ownsServer = true
         stopping = false
-        log = []
+        log = leftoverNote.map { [$0] } ?? []  // said once, at the top of the next server's log
+        leftoverNote = nil
         status = .starting(since: .now)
         let lines = PipeReader.lines(pipe.fileHandleForReading)
         Task { [weak self] in
@@ -134,6 +168,59 @@ public final class LayaController {
         let deadline = Date().addingTimeInterval(3)
         while p.isRunning && Date() < deadline { usleep(50_000) }
         if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        forget(p.processIdentifier)
+    }
+
+    // MARK: - a server left behind
+
+    /// At launch: end the laya-serve an earlier Dewey started and never got to stop. Without this the
+    /// next start would find it answering, take it for someone else's and leave it running for good,
+    /// with nobody reading its log.
+    ///
+    /// It is ended only when it is that very process (same pid and start time as written down) and its
+    /// Dewey is gone (it now belongs to launchd): a server another running Dewey owns is left alone.
+    @discardableResult
+    public func stopLeftover() async -> Bool {
+        guard process == nil, let record, let was = Self.read(record) else { return false }
+        /// The process written down, while it is still there.
+        func same() -> RunningProcess? {
+            guard let now = RunningProcess.find(was.pid), now.startSec == was.startSec,
+                  now.startUsec == was.startUsec else { return nil }
+            return now
+        }
+        guard let now = same() else {  // gone, or the pid is another program's now: the note is out of date
+            try? FileManager.default.removeItem(at: record)
+            return false
+        }
+        guard now.parent == 1 else { return false }  // the child of a Dewey that is running: theirs, note and all
+        kill(was.pid, SIGTERM)
+        for patience in [5.0, 2.0] {  // uvicorn shuts down cleanly; SIGKILL if it hasn't after 5 s
+            let deadline = Date().addingTimeInterval(patience)
+            while same() != nil && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+            if same() != nil { kill(was.pid, SIGKILL) }
+        }
+        try? FileManager.default.removeItem(at: record)
+        let note = "Stopped the laya-serve an earlier Dewey left running (pid \(was.pid), port \(was.port))."
+        leftoverNote = note
+        append(note)
+        return true
+    }
+
+    private func remember(_ pid: Int32) {
+        guard let record, let now = RunningProcess.find(pid) else { return }
+        let note = ServerRecord(pid: pid, startSec: now.startSec, startUsec: now.startUsec, port: port)
+        try? FileManager.default.createDirectory(at: record.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(note).write(to: record, options: .atomic)
+    }
+
+    /// Drop the note once the server it names is gone (not one a newer start has written since).
+    private func forget(_ pid: Int32) {
+        guard let record, Self.read(record)?.pid == pid else { return }
+        try? FileManager.default.removeItem(at: record)
+    }
+
+    static func read(_ record: URL) -> ServerRecord? {
+        (try? Data(contentsOf: record)).flatMap { try? JSONDecoder().decode(ServerRecord.self, from: $0) }
     }
 
     private func pollUntilReady() async {
@@ -151,8 +238,9 @@ public final class LayaController {
         if log.count > 200 { log.removeFirst(log.count - 200) }
     }
 
-    private func exited(_ code: Int32) {
+    private func exited(_ code: Int32, pid: Int32) {
         pollTask?.cancel()
+        forget(pid)
         process = nil
         executable = nil
         ownsServer = false

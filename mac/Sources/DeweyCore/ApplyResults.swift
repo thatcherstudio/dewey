@@ -34,6 +34,9 @@ public struct ApplyPreview: Decodable, Sendable, Equatable {
     public var destRoot: String?
     /// That place is outside the folder itself (plan.dest): the files leave it.
     public var destOutside: Bool?
+    /// A fingerprint of `selected` (which rows, from where, to where). Move sends it back
+    /// (`--expect-sha`), so dewey moves these rows or none (dewey before 0.2.1 has none).
+    public var selectionSha256: String?
 
     /// "~/Sorted" when the files leave the folder, for the screen to say so before they move.
     public var leavesFolderFor: String? {

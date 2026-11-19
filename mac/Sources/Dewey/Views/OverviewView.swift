@@ -3,6 +3,7 @@ import SwiftUI
 
 /// `dewey status` as cards, with the Scan & Plan button.
 struct OverviewView: View {
+    @Environment(AppModel.self) private var model
     let folder: FolderModel
     @State private var confirmNewPlan = false
 
@@ -21,6 +22,7 @@ struct OverviewView: View {
                         Button("Try Again") { Task { await folder.refresh() } }
                     }
                 }
+                modelNote
                 if let status = folder.status {
                     if status.catalog {
                         StatusCards(status: status, review: { folder.openReview() },
@@ -74,6 +76,31 @@ struct OverviewView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// The toolbar's Laya light is about the Laya this app runs. A folder whose own settings name
+    /// another model says so here, where its plans are started.
+    @ViewBuilder
+    private var modelNote: some View {
+        let appLaya = ModelSource.place(model.laya.baseURL.absoluteString)
+        switch folder.modelSource {
+        case .otherLaya(let place):
+            Notice(systemImage: "arrow.triangle.branch", tint: .orange,
+                   text: "This folder's plans ask a model at \(place), not the Laya this app runs (\(appLaya)). "
+                         + "The Laya light in the toolbar is about the app's own. If that isn't what you meant, "
+                         + "change the server in this folder's Settings, under Decisions.") {
+                Button("Open Settings") { folder.tab = .settings }
+            }
+        case .chat(let place):
+            Notice(systemImage: "info.circle", tint: .secondary,
+                   text: "This folder's plans ask a chat model at \(place), not Laya (Settings, under Decisions).")
+        case .rulesOnly:
+            Notice(systemImage: "info.circle", tint: .secondary,
+                   text: "This folder plans with rules only, no model (Settings, under Decisions). Files no rule "
+                         + "covers stay where they are.")
+        case .appLaya, nil:
+            EmptyView()
         }
     }
 

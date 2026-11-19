@@ -61,6 +61,15 @@ final class FolderModel {
     var hasUnsavedChanges: Bool { review?.hasChanges ?? false }
     var hasUnsavedSettings: Bool { settings?.hasChanges ?? false }
 
+    /// Which model this folder's plans ask: the Laya this app runs, or something else its own
+    /// settings name. nil until `dewey status` has answered.
+    var modelSource: ModelSource? {
+        guard let d = status?.decider, let app else { return nil }
+        return ModelSource(backend: d.backend, url: d.url, appLaya: app.laya.baseURL)
+    }
+    /// Plans here wait for the app's Laya and can start it (also assumed until status has answered).
+    var usesAppLaya: Bool { modelSource?.isAppLaya ?? true }
+
     /// Still there (an external disk may be unplugged, a folder renamed in Finder).
     var exists: Bool {
         var isDir: ObjCBool = false
@@ -86,7 +95,8 @@ final class FolderModel {
     func scanAndPlan() {
         guard let app, let cli = app.cli, !isRunning else { return }
         let laya = app.laya
-        let session = ScanPlanSession(cli: cli, root: path, modelLoading: {
+        let session = ScanPlanSession(cli: cli, root: path, modelLoading: { [weak self] in
+            guard self?.usesAppLaya ?? true else { return false }  // another server: nothing here to wait for
             if case .starting = laya.status { return true }
             return false
         })
@@ -158,6 +168,14 @@ final class FolderModel {
         if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
     }
 
+    /// Close a move that didn't start because the plan changed, onto Apply and its new preview.
+    func dismissToApply() {
+        guard !isRunning else { return }
+        moveRun = nil
+        undoRun = nil
+        tab = .apply
+    }
+
     /// Close the move or undo screen, onto History (where the batch now is).
     func dismissMoves() {
         guard !isRunning else { return }
@@ -185,7 +203,7 @@ final class FolderModel {
     /// New settings: category paths change where planned rows go, and Review's category list.
     func settingsSaved() {
         Task {
-            if statusErrorCode == "config" { await refresh() }
+            await refresh()  // a fixed dewey.toml, and which model the folder asks now
             if let review, !review.hasChanges { await review.load() }
             if apply != nil { await apply?.refresh() }
         }

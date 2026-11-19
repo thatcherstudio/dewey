@@ -143,6 +143,13 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
         public var n: Int
     }
 
+    /// The folder's `[decider]` settings: which model its plans ask.
+    public struct Decider: Decodable, Sendable, Equatable {
+        public var backend: String
+        public var url: String
+        public var model: String
+    }
+
     public var catalog: Bool
     public var root: String
     public var state: String
@@ -161,9 +168,11 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
     public var labels: [LabelCount]
     /// Errors from the last scan (the first 20).
     public var errors: [PathError]
+    /// Which model the folder's settings name (dewey before 0.2.1 doesn't say). See `ModelSource`.
+    public var decider: Decider?
 
     enum CodingKeys: String, CodingKey {
-        case catalog, root, state, scan, kinds, duplicates, topTypes, plans, batches, undoable, labels, errors
+        case catalog, root, state, scan, kinds, duplicates, topTypes, plans, batches, undoable, labels, errors, decider
     }
 
     public init(from decoder: Decoder) throws {
@@ -180,6 +189,7 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
         undoable = try c.decodeIfPresent(String.self, forKey: .undoable)
         labels = try c.decodeIfPresent([LabelCount].self, forKey: .labels) ?? []
         errors = try c.decodeIfPresent([PathError].self, forKey: .errors) ?? []
+        decider = try c.decodeIfPresent(Decider.self, forKey: .decider)
     }
 
     public var latestPlan: Plan? { plans.first }

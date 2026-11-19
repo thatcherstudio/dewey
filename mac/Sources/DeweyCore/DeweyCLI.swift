@@ -5,7 +5,8 @@ public enum DeweyError: Error, Equatable, LocalizedError {
     case failed(code: String, message: String)
     /// Stopped by Cancel (SIGINT). `batch` is set when files were moving: undo that batch.
     case interrupted(batch: String?)
-    /// Exited without a closing event (a Python crash before dewey started, a wrong executable…).
+    /// Exited without a closing event (a Python crash before dewey started, a wrong executable, a
+    /// stuck dewey ended after Cancel…).
     case crashed(status: Int32, stderr: String)
     case launch(String)
     case undecodable(String)
@@ -23,6 +24,19 @@ public enum DeweyError: Error, Equatable, LocalizedError {
     }
 }
 
+/// How long a cancelled dewey gets to stop by itself before it is made to.
+public struct StopPatience: Sendable, Equatable {
+    /// Seconds after SIGINT before SIGTERM.
+    public var terminate: TimeInterval
+    /// Seconds after SIGINT before SIGKILL.
+    public var kill: TimeInterval
+
+    public init(terminate: TimeInterval = 5, kill: TimeInterval = 8) {
+        self.terminate = terminate
+        self.kill = kill
+    }
+}
+
 /// One running `dewey <command> --json` process.
 public final class DeweyRun: @unchecked Sendable {  // Process isn't Sendable; it is only used thread-safely here
     public let arguments: [String]
@@ -31,20 +45,53 @@ public final class DeweyRun: @unchecked Sendable {  // Process isn't Sendable; i
     private let process: Process
     private let exitTask: Task<Int32, Never>
     private let stderrTask: Task<String, Never>
+    private let patience: StopPatience
+    private let lock = NSLock()
+    private var cancelled = false
 
     init(arguments: [String], events: AsyncStream<DeweyEvent>, process: Process,
-         exitTask: Task<Int32, Never>, stderrTask: Task<String, Never>) {
+         exitTask: Task<Int32, Never>, stderrTask: Task<String, Never>, patience: StopPatience) {
         self.arguments = arguments
         self.events = events
         self.process = process
         self.exitTask = exitTask
         self.stderrTask = stderrTask
+        self.patience = patience
+    }
+
+    /// A move or an undo. It is only ever asked to stop (SIGINT, after the file in hand): ending it
+    /// in the middle of a copy to another disk would leave a half-written file behind.
+    public static func movesFiles(_ arguments: [String]) -> Bool {
+        switch arguments.first {
+        case "undo": true
+        case "apply": !arguments.contains("--dry-run")
+        default: false
+        }
     }
 
     /// Cancel the way Ctrl-C does: dewey stops after the current item, keeps what's done, and a batch
     /// that was moving files stays undoable.
+    ///
+    /// A dewey that moves nothing (scan, plan and the rest) and is still there after that is stuck, on
+    /// a disk that stopped answering for one: it gets SIGTERM, then SIGKILL. Nothing is left half done
+    /// by that: its catalog is SQLite, a plan counts only once the catalog has it, and the files it
+    /// saves (the plan CSV, dewey.toml) are swapped in whole.
     public func cancel() {
-        if process.isRunning { process.interrupt() }
+        guard process.isRunning else { return }
+        process.interrupt()
+        guard !Self.movesFiles(arguments) else { return }
+        lock.lock()
+        let first = !cancelled
+        cancelled = true
+        lock.unlock()
+        guard first else { return }
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        queue.asyncAfter(deadline: .now() + patience.terminate) { [process] in
+            if process.isRunning { process.terminate() }
+        }
+        queue.asyncAfter(deadline: .now() + patience.kill) { [process] in
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
     }
 
     public func exitStatus() async -> Int32 { await exitTask.value }
@@ -56,6 +103,7 @@ public final class DeweyRun: @unchecked Sendable {  // Process isn't Sendable; i
 public struct DeweyCLI: Sendable {
     public let executable: URL
     public var environment: [String: String]
+    public var patience = StopPatience()
 
     public init(executable: URL, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.executable = executable
@@ -102,11 +150,12 @@ public struct DeweyCLI: Sendable {
             return -1
         }
         return DeweyRun(arguments: arguments, events: events, process: process, exitTask: exitTask,
-                        stderrTask: stderrTask)
+                        stderrTask: stderrTask, patience: patience)
     }
 
     /// Run to the end, passing every event to `onEvent`, and decode the result. Cancelling the calling
-    /// task cancels dewey (SIGINT), which then throws `.interrupted`.
+    /// task cancels dewey (`DeweyRun.cancel`), which then throws `.interrupted`, or `.crashed` when
+    /// dewey had to be ended.
     public func run<T: Decodable & Sendable>(
         _ arguments: [String], stdin: Data? = nil, as type: T.Type,
         onEvent: @escaping @Sendable (DeweyEvent) async -> Void = { _ in }

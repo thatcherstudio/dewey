@@ -167,6 +167,83 @@ struct LayaControllerTests {
         #expect(await LayaController.probe(laya.baseURL) == .refused)
     }
 
+    // MARK: a server left behind (a crash, Force Quit)
+
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
+    func theServerItStartsIsWrittenDownUntilItStops() async throws {
+        let dir = try tempDir()
+        let exe = dir.appending(path: "laya-serve"), record = dir.appending(path: "support/laya-serve.json")
+        try makeFile(exe, executable: true, text: fakeLaya)
+        let port = Int.random(in: 10_000...14_000)
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        let laya = LayaController(baseURL: base, record: record)
+        await laya.start(executable: exe)
+        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        let note = try #require(LayaController.read(record))
+        let running = try #require(RunningProcess.find(note.pid))
+        #expect(note.port == port && note.startSec == running.startSec && note.startUsec == running.startUsec)
+        #expect(running.parent == getpid())
+
+        // another Dewey opening now: the server has a living owner, so it and its note are left alone
+        let second = LayaController(baseURL: base, record: record)
+        #expect(await second.stopLeftover() == false)
+        #expect(await LayaController.probe(base) == .ok(.init(loaded: ["english"], device: "cpu")))
+        #expect(LayaController.read(record) == note)
+
+        await laya.stopAndWait()
+        #expect(!FileManager.default.fileExists(atPath: record.path))
+    }
+
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
+    func aServerLeftByAnEarlierDeweyIsStoppedAtLaunch() async throws {
+        let dir = try tempDir()
+        let exe = dir.appending(path: "laya-serve"), record = dir.appending(path: "laya-serve.json")
+        try makeFile(exe, executable: true, text: fakeLaya)
+        let port = Int.random(in: 14_001...19_000)
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+
+        // What a Dewey that crashed leaves: its laya-serve, now launchd's child, and the note about it.
+        let sh = Process(), out = Pipe()
+        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
+        sh.arguments = ["-c", "LAYA_HOST=127.0.0.1 LAYA_PORT=\(port) LAYA_MODELS=english \"$0\" >/dev/null 2>&1 & echo $!", exe.path]
+        sh.standardOutput = out
+        try sh.run()
+        sh.waitUntilExit()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let pid = try #require(Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        defer { kill(pid, SIGKILL) }  // whatever the test finds, nothing outlives it
+        try await waitFor(seconds: 10) { await LayaController.probe(base) != .refused }
+        let orphan = try #require(RunningProcess.find(pid))
+        #expect(orphan.parent == 1)
+        try JSONEncoder().encode(ServerRecord(pid: pid, startSec: orphan.startSec, startUsec: orphan.startUsec, port: port))
+            .write(to: record)
+
+        let laya = LayaController(baseURL: base, record: record)
+        #expect(await laya.stopLeftover())
+        #expect(RunningProcess.find(pid) == nil)
+        #expect(await LayaController.probe(base) == .refused)
+        #expect(!FileManager.default.fileExists(atPath: record.path))
+        #expect(laya.log.last?.contains("left running") == true)
+        await laya.refresh()
+        #expect(laya.status == .stopped)  // not "ready, started outside Dewey"
+        #expect(await laya.stopLeftover() == false)
+    }
+
+    /// A pid is handed out again once its process is gone. The start time tells the two apart.
+    @Test func aNoteThatNoLongerFitsItsProcessStopsNothing() async throws {
+        let record = try tempDir().appending(path: "laya-serve.json")
+        let me = try #require(RunningProcess.find(getpid()))
+        for stale in [ServerRecord(pid: getpid(), startSec: me.startSec - 60, startUsec: me.startUsec, port: 8000),
+                      ServerRecord(pid: 0x3FFF_FFF0, startSec: 1, startUsec: 1, port: 8000)] {
+            try JSONEncoder().encode(stale).write(to: record)
+            #expect(await LayaController(record: record).stopLeftover() == false)
+            #expect(!FileManager.default.fileExists(atPath: record.path))
+        }
+        try Data("not json".utf8).write(to: record)
+        #expect(await LayaController(record: record).stopLeftover() == false)
+        #expect(await LayaController().stopLeftover() == false)  // no note kept: nothing to look for
+    }
+
     private func waitFor(seconds: Double, _ condition: @MainActor () async -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {

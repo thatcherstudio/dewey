@@ -202,8 +202,10 @@ struct ApplyWithDeweyTests {
         let all = try #require(apply.preview)
         #expect(all.files == 2 && all.folders == 2)
         apply.pruneEmpty = true
+        let sha = try #require(all.selectionSha256)
+        #expect(sha != preview.selectionSha256)  // other rows, another fingerprint
         #expect(apply.moveArguments() == ["apply", root.path, "--plan", String(all.planId), "--include-review",
-                                          "--prune-empty"])
+                                          "--prune-empty", "--expect-sha", sha])
 
         let move = CommandRun<ApplyResult>(cli: cli, arguments: try #require(apply.moveArguments()), phases: ["move"])
         move.start()
@@ -266,6 +268,38 @@ struct ApplyWithDeweyTests {
         await undo.wait()
         #expect(undo.value?.restored == 2)
         #expect(exists(root, "setup.dmg"))
+    }
+
+    /// The preview is on screen; the plan is then saved again (Review in another window, Numbers).
+    /// Move must not run the new plan under the old preview.
+    @Test func aPlanChangedAfterThePreviewMovesNothingUntilItIsLookedAtAgain() async throws {
+        let (cli, root) = try await plannedFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let apply = ApplyPlan(cli: cli, root: root.path)
+        await apply.refresh()
+        let shown = try #require(apply.moveArguments())
+
+        let review = PlanReview(cli: cli, root: root.path)
+        await review.load()
+        let dmg = try #require(review.visible.first { $0.src == "setup.dmg" }?.id)
+        review.setDestination("Somewhere Else/", for: dmg)
+        #expect(await review.save())
+
+        let stale = CommandRun<ApplyResult>(cli: cli, arguments: shown, phases: ["move"])
+        stale.start()
+        await stale.wait()
+        #expect(stale.planChanged)
+        for (path, _) in Self.files { #expect(exists(root, path), "\(path) should not have moved") }
+        let status = try await cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(status.batches.isEmpty)
+
+        await apply.refresh()  // what the folder does when a move ends
+        #expect(apply.preview?.selected.first { $0.src == "setup.dmg" }?.dst == "Somewhere Else/setup.dmg")
+        let move = CommandRun<ApplyResult>(cli: cli, arguments: try #require(apply.moveArguments()), phases: ["move"])
+        move.start()
+        await move.wait()
+        #expect(!move.planChanged && move.value?.counts.moved == 2)
+        #expect(exists(root, "Somewhere Else/setup.dmg"))
     }
 
     @Test func aRefusedRowIsListedAndDoesntMove() async throws {

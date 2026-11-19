@@ -42,6 +42,41 @@ struct ResultsTests {
         #expect(s.plans.isEmpty)
         #expect(s.latestPlan == nil)
         #expect(s.duplicates.copies == 0)
+        #expect(s.decider == nil)  // dewey before 0.2.1 doesn't say
+    }
+
+    @Test func statusSaysWhichModelTheFolderAsks() throws {
+        let line = #"{"event": "result", "data": {"catalog": false, "root": "/Users/x/new", "state": "/Users/x/new/.dewey", "decider": {"backend": "systemone", "url": "http://127.0.0.1:8000", "model": "english"}}}"#
+        let s = try decodeResult(line, as: FolderStatus.self)
+        #expect(s.decider == .init(backend: "systemone", url: "http://127.0.0.1:8000", model: "english"))
+    }
+
+    /// The app runs one Laya; a folder's own settings can name another model. Which is it?
+    @Test func aFoldersModelIsTheAppsLayaOnlyWhenTheAddressesReachOneServer() throws {
+        let app = try #require(URL(string: "http://127.0.0.1:8000"))
+        func source(_ url: String, _ backend: String = "systemone") -> ModelSource {
+            ModelSource(backend: backend, url: url, appLaya: app)
+        }
+        // every way of writing this Mac and that port is the app's Laya
+        for same in ["http://127.0.0.1:8000", "http://localhost:8000", "http://127.0.0.1:8000/", " HTTP://LOCALHOST:8000 ",
+                     "http://[::1]:8000"] {
+            #expect(source(same) == .appLaya, "\(same)")
+            #expect(source(same).isAppLaya)
+        }
+        // the usual mix-up: the app's Laya moved to another port, the folder still says 8000 (or the reverse)
+        #expect(source("http://127.0.0.1:8001") == .otherLaya("127.0.0.1:8001"))
+        #expect(ModelSource(backend: "systemone", url: "http://127.0.0.1:8000",
+                            appLaya: try #require(URL(string: "http://127.0.0.1:8001"))) == .otherLaya("127.0.0.1:8000"))
+        #expect(source("http://192.168.1.20:8000") == .otherLaya("192.168.1.20:8000"))
+        #expect(source("https://127.0.0.1:8000") == .otherLaya("127.0.0.1:8000"))
+        #expect(source("https://laya.example.com/team") == .otherLaya("laya.example.com"))
+        #expect(source("http://127.0.0.1") == .otherLaya("127.0.0.1"))  // port 80
+        #expect(source("not a url") == .otherLaya("not a url"))
+        // a chat model or no model is never Laya, whatever the address says
+        #expect(source("http://127.0.0.1:8080", "chat") == .chat("127.0.0.1:8080"))
+        #expect(source("http://127.0.0.1:8000", "chat") == .chat("127.0.0.1:8000"))
+        #expect(source("http://127.0.0.1:8000", "none") == .rulesOnly)
+        #expect(!source("http://127.0.0.1:8000", "none").isAppLaya)
     }
 
     @Test func anInterruptedPlanHasAnEmptySummary() throws {

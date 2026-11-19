@@ -109,7 +109,14 @@ Things worth knowing:
 - **Dewey > Settings… (⌘,)** holds app preferences: where `dewey` and `laya-serve` are (empty = the
   dewey inside the app, and the `laya-serve` Install Laya set up, else the one in `~/.venvs/laya/bin`,
   `~/.local/bin`, Homebrew, then your shell's `PATH`), the model's URL, and whether Laya starts when
-  Dewey opens.
+  Dewey opens. That URL is the Laya the app starts and watches. Each folder asks the model its own
+  Settings name (under Decisions); when that is another server, a chat model or no model, the
+  folder's Overview says so.
+- **Cancel** stops a scan or a plan after the file in hand and keeps what is done. A dewey that
+  doesn't stop (a disk that no longer answers) is ended a few seconds later. A move is only ever
+  asked to stop, so it always finishes the file it is copying.
+- **Move does what the preview showed.** If the plan's CSV was saved again, or a setting changed,
+  after the preview was made, nothing moves and you get the new preview to look at.
 - **Install Laya** uses a copy of uv inside the app, and keeps everything in one folder, which Time
   Machine skips because it downloads again. It installs one fixed release of Laya (0.4.37), its
   dependencies as they were on the day that release was tried, and one fixed commit of the model:
@@ -119,7 +126,8 @@ Things worth knowing:
   what it got. In Terminal, run it as
   `~/Library/Application\ Support/Dewey/Laya/bin/laya-serve`.
 - **Quitting** stops the `laya-serve` the app started, and an install in progress. A move in
-  progress stops after the file in hand, and History can undo what moved.
+  progress stops after the file in hand, and History can undo what moved. After a crash or a Force
+  Quit, the next launch stops the `laya-serve` that was left running.
 - **To start over**, `defaults delete io.github.thatcherstudio.dewey` forgets the folder list and
   preferences. Each folder's `.dewey/` stays.
 
@@ -186,6 +194,8 @@ sqlite3 ~/Downloads/.dewey/catalog.db \
   that exists, means "into that folder": `Data/Exports/` gives `Data/Exports/data.csv`.
   For a whole-folder row (`action` = `folder`), `category` can also be a kind from `[folders]` (`code`, `cad`, …).
 - Don't edit `src` or `row`. Rows with an edited `src` are refused.
+- `apply --dry-run` ends with an `--expect-sha` to copy. Given to the real `apply`, it moves those
+  rows or, if the plan or a setting changed in between, nothing.
 
 The CSV is saved as UTF-8 with a BOM, so Excel and Numbers open accented filenames correctly. When you
 save from Excel, choose "CSV UTF-8": plain "CSV" can mangle accented names, and those rows are then
@@ -218,7 +228,8 @@ refused (never mis-moved).
   project folder (one containing `.git`, `package.json`, `pyproject.toml`, `Makefile`, …: see
   `project_markers`) are cataloged as one unit and never opened or split.
 - **Interrupted?** Each move is committed as it happens, and a batch stopped by a crash, Ctrl-C or a
-  closed terminal still shows up for a plain `dewey undo ROOT`.
+  closed terminal still shows up for a plain `dewey undo ROOT`. Ctrl-C during a scan or a plan
+  keeps the hashes and answers so far and exits at once, without waiting for a file it is stuck on.
 - **Never touched:** symlinks (recorded, not followed: no cycles, nothing outside the root),
   iCloud "Optimize Storage" placeholders (cataloged but not read, so a scan doesn't download your
   iCloud Drive), and `.DS_Store`.
@@ -279,7 +290,8 @@ make test-app                               # both again, against the Python and
 The Mac app is a SwiftPM package in `mac/`: `DeweyCore` (running dewey, decoding its events, the
 models behind each tab; all tested) and `Dewey` (SwiftUI). It drives dewey through `--json`: one JSON
 event per line on stdout, ending in exactly one `result`, `error` (with a `code`) or `interrupted`
-event; Cancel is SIGINT. `make app` runs `scripts/build-app.sh`, which puts uv's standalone CPython
+event; Cancel is SIGINT (then SIGTERM and SIGKILL for a dewey that moves nothing and doesn't
+stop). `make app` runs `scripts/build-app.sh`, which puts uv's standalone CPython
 (trimmed, with dewey and its extras installed) in `Contents/Resources/python` and a `bin/dewey`
 launcher beside it that runs it isolated (`-I`) and writes no `.pyc` files into the signed app.
 `build/python` keeps that Python between builds. `swift scripts/make-icon.swift` redraws the icon.

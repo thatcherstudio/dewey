@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
+import threading
 import traceback
 from contextlib import closing
 from pathlib import Path
@@ -137,7 +139,8 @@ def cmd_apply(args):
     catalog.check_safe_root(root)
     with closing(catalog.open_db(state)) as conn:
         return mover.apply(conn, root, cfg, state, plan_id=args.plan, csv_path=args.csv,
-                           include_review=args.include_review, dry_run=args.dry_run, prune_empty=args.prune_empty)
+                           include_review=args.include_review, dry_run=args.dry_run, prune_empty=args.prune_empty,
+                           expect_sha=args.expect_sha)
 
 
 def cmd_undo(args):
@@ -249,12 +252,14 @@ def status_data(conn, root: Path, state: Path) -> dict:
 
 def cmd_status(args):
     root, state, cfg, _ = _ctx(args)
+    d = cfg["decider"]  # the app shows when this isn't the Laya it runs itself
+    model = {"backend": d["backend"], "url": str(d["url"]), "model": str(d["model"])}
     if not (state / "catalog.db").exists():
         if progress.json_mode():  # a folder dewey hasn't scanned yet is a normal state for the app
-            return {"catalog": False, "root": str(root), "state": str(state)}
+            return {"catalog": False, "root": str(root), "state": str(state), "decider": model}
         _need_catalog(state, args.root)
     with closing(catalog.open_db(state)) as conn:
-        st = status_data(conn, root, state)
+        st = {**status_data(conn, root, state), "decider": model}
     s = st["scan"]
     if s:
         say(f"Last scan #{s['id']} finished {s['finished']}: {s['files']:,} files, {human_bytes(s['bytes'] or 0)}, "
@@ -324,6 +329,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--include-review", action="store_true", help="also move rows with status=review")
     p.add_argument("--dry-run", action="store_true", help="show what would move")
     p.add_argument("--prune-empty", action="store_true", help="remove folders left empty (a lone .DS_Store counts as empty)")
+    p.add_argument("--expect-sha", help="move only what a dry run listed: refuse if the moves aren't the ones "
+                                        "whose sha256 that dry run printed (the plan or settings changed since)")
     p = add("undo", cmd_undo, "reverse a batch"); p.add_argument("--batch", help="batch id (default: latest)")
     add("status", cmd_status, "summarize the catalog")
     p = add("export-labels", cmd_export_labels, "export decisions for fine-tuning")
@@ -355,9 +362,41 @@ def _catch_signals() -> dict:
         return {}
 
 
+def _leave_now(code) -> None:
+    """Exit without waiting for worker threads that are still in a file or a request.
+
+    A scan or plan that is stopped, or fails, leaves a few of them in flight (catalog.scan,
+    planner.decide_all). They only read files and wait for the model, and the catalog is committed and
+    closed by the time main() gets here. Python would wait for every one of them before exiting, so a
+    parser stuck on one PDF kept a cancelled scan alive for as long as it was stuck."""
+    if code is not None and not isinstance(code, int):  # SystemExit("message"): Python prints it and exits 1
+        try:
+            sys.stderr.write(f"{code}\n")
+        except (OSError, ValueError):
+            pass
+        code = 1
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code or 0)
+
+
 def main(argv=None):
+    """The `dewey` command. With no argv it is the program itself (not a test calling main([...])),
+    so an exit that leaves worker threads behind doesn't wait for them."""
+    try:
+        _main(argv)
+    except SystemExit as e:
+        if argv is None and threading.active_count() > 1:
+            _leave_now(e.code)
+        raise
+
+
+def _main(argv=None):
     if sys.version_info < (3, 11):
-        raise SystemExit("dewey needs Python 3.11+ (uses tomllib and hashlib.file_digest)")
+        raise SystemExit("dewey needs Python 3.11+ (uses tomllib)")
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv  # known before parsing, so a usage error is an event too
     progress.set_json(as_json)

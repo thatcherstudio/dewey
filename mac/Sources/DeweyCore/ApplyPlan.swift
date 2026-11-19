@@ -53,12 +53,15 @@ public final class ApplyPlan {
         }
     }
 
-    /// `dewey apply` for the plan the preview showed, with the options it was made with.
+    /// `dewey apply` for the plan the preview showed, with the options it was made with. `--expect-sha`
+    /// holds dewey to the rows on screen: if the plan's CSV was saved again since (Numbers, Review in
+    /// another window) or a setting changed where a row goes, it moves nothing and says `stale`.
     public func moveArguments() -> [String]? {
         guard let preview, canMove else { return nil }
         var args = ["apply", root, "--plan", String(preview.planId)]
         if previewIncludesReview { args.append("--include-review") }
         if pruneEmpty { args.append("--prune-empty") }
+        if let sha = preview.selectionSha256 { args += ["--expect-sha", sha] }
         return args
     }
 }

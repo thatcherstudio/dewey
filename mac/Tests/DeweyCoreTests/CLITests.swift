@@ -21,9 +21,18 @@ case "$1" in
   crash)
     echo 'Traceback (most recent call last): boom' >&2
     exit 3 ;;
+  deaf)
+    echo '{"event": "error", "code": "config", "message": "broken settings"}'
+    exit 1 ;;
   noisy)
     i=0; while [ $i -lt 3000 ]; do echo "stderr line $i padding padding padding padding" >&2; i=$((i+1)); done
     echo '{"event": "result", "data": {"value": "survived"}}' ;;
+  stuck|apply)
+    # Doesn't hear Ctrl-C or SIGTERM. "stuck" never ends by itself; "apply" finishes its move a moment later.
+    trap '' INT TERM
+    echo '{"event": "progress", "phase": "hash", "label": "Hashing", "unit": "files", "n": 0, "total": 9, "bytes": 0, "total_bytes": null, "rate": 0, "elapsed": 0, "eta": null, "extra": "", "done": false}'
+    i=0; while [ "$1" = stuck ] || [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done
+    echo '{"event": "result", "data": {"value": "moved"}}' ;;
   slow)
     trap 'echo "{\"event\": \"interrupted\", \"batch\": \"b1\", \"message\": \"stopped\"}"; exit 130' INT
     echo '{"event": "progress", "phase": "decide", "label": "Deciding", "unit": "files", "n": 0, "total": 9, "bytes": 0, "total_bytes": null, "rate": 0, "elapsed": 0, "eta": null, "extra": "", "done": false}'
@@ -70,6 +79,16 @@ struct CLITests {
         #expect(c == Count(n: 3))
     }
 
+    /// Save in Review sends every change on stdin. A dewey that stops before reading it (a broken
+    /// dewey.toml, an unplugged disk) closes the pipe under the write: that must be an error on the
+    /// screen, not SIGPIPE ending the app.
+    @Test func aDeweyThatExitsWithoutReadingItsInputIsAnErrorNotACrash() async throws {
+        let big = Data(repeating: UInt8(ascii: "x"), count: 4_000_000)  // far more than a pipe holds
+        await #expect(throws: DeweyError.failed(code: "config", message: "broken settings")) {
+            try await makeFake().run(["deaf"], stdin: big, as: Value.self)
+        }
+    }
+
     @Test func errorEventThrowsWithItsCode() async throws {
         await #expect(throws: DeweyError.failed(code: "nothing_to_undo", message: "nothing to undo")) {
             try await makeFake().run(["fail"], as: Value.self)
@@ -108,6 +127,41 @@ struct CLITests {
         try await Task.sleep(for: .milliseconds(300))
         task.cancel()
         await #expect(throws: DeweyError.interrupted(batch: "b1")) { try await task.value }
+    }
+
+    /// A scan stuck on a disk that stopped answering never sees the SIGINT. Cancel still ends it.
+    @Test func aDeweyThatDoesntHearCancelIsEnded() async throws {
+        var cli = try makeFake()
+        cli.patience = StopPatience(terminate: 0.2, kill: 0.5)
+        let run = try cli.start(["stuck"])
+        let started = Date()
+        for await e in run.events {
+            if case .progress = e { run.cancel() }
+        }
+        #expect(await run.exitStatus() == SIGKILL)
+        #expect(Date().timeIntervalSince(started) < 5)
+
+        let task = Task { try await cli.run(["stuck"], as: Value.self) }
+        try await Task.sleep(for: .milliseconds(300))
+        task.cancel()
+        await #expect(throws: DeweyError.crashed(status: SIGKILL, stderr: "")) { try await task.value }
+    }
+
+    /// A move is only asked to stop: ending it mid-copy would leave half a file behind.
+    @Test func aMoveIsAskedToStopAndNeverEnded() async throws {
+        var cli = try makeFake()
+        cli.patience = StopPatience(terminate: 0.1, kill: 0.2)
+        let run = try cli.start(["apply", "/some/root"])
+        var last: DeweyEvent?
+        for await e in run.events {
+            if case .progress = e { run.cancel() }
+            last = e
+        }
+        #expect(last?.isClosing == true)  // it got to finish what it was doing, a second later
+        #expect(await run.exitStatus() == 0)
+        #expect(DeweyRun.movesFiles(["undo", "/r", "--batch", "b"]))
+        #expect(!DeweyRun.movesFiles(["apply", "/r", "--dry-run"]))
+        #expect(!DeweyRun.movesFiles(["scan", "/r"]) && !DeweyRun.movesFiles(["plan", "/r"]))
     }
 
     @Test func missingExecutableIsALaunchError() async throws {

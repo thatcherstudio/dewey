@@ -24,6 +24,9 @@ public final class LayaInstaller {
         }
 
         public var bin: URL { root.appending(path: "bin") }
+        /// The app's note of the laya-serve it is running (`LayaController.stopLeftover`). Beside the
+        /// install, not in it: Remove Laya must not take the note of a server that is still up.
+        public var serverRecord: URL { root.deletingLastPathComponent().appending(path: "laya-serve.json") }
         /// The wrapper the app runs. It exists only once an install has finished.
         public var layaServe: URL { bin.appending(path: Tool.layaServe.rawValue) }
         /// uv's managed Pythons (UV_PYTHON_INSTALL_DIR), so the venv never depends on one Homebrew upgrades.

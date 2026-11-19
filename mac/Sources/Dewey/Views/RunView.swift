@@ -58,6 +58,7 @@ struct RunView: View {
         case .waitingForModel: "Waiting for the model…"
         case .finished: "Plan \(session.plan?.planId ?? 0) is ready"
         case .failed(.scan, _): "The scan stopped"
+        case .failed(.plan, _) where session.remoteServerQuestion != nil: "One question before planning"
         case .failed(.plan, _): "The plan couldn't be made"
         case .stopped: "Stopped"
         }
@@ -96,7 +97,17 @@ struct RunView: View {
             return true
         }()
         VStack(alignment: .leading, spacing: 12) {
-            if session.needsModel {
+            if let question = session.remoteServerQuestion {
+                Notice(systemImage: "network", tint: .orange,
+                       text: "The scan is done, and nothing has been sent anywhere. \(question) "
+                             + "Allow it only if you set that up yourself.")
+                HStack {
+                    Button("Allow and Plan") { session.retryPlan(rulesOnly: false, allowRemote: true) }
+                        .help("Dewey remembers this for this folder and this server.")
+                    Button("Plan with Rules Only") { session.retryPlan(rulesOnly: true) }
+                        .help("Plan with your rules and duplicates; nothing leaves this Mac.")
+                }
+            } else if session.needsModel {
                 Notice(systemImage: "brain", tint: .orange,
                        text: "The scan is done, but the decision model didn't answer, so no plan was made. "
                              + "Start it and try again, or plan with your rules only.")

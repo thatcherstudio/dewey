@@ -32,7 +32,8 @@ struct HistoryView: View {
                                 undoRequest = UndoRequest(
                                     batch: b.batch,
                                     what: b.undone == 0 ? b.movesText : "the \(ProgressText.count(b.out)) still moved",
-                                    newerBatch: batches[..<i].contains { $0.out > 0 })
+                                    newerBatch: batches[..<i].contains { $0.out > 0 },
+                                    from: b.destOutside)
                             })
                         }
                     }

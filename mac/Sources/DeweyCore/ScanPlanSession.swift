@@ -60,15 +60,25 @@ public final class ScanPlanSession {
         return false
     }
 
+    /// The plan stopped before sending anything, because this folder's own settings name a decision
+    /// model on another machine (dewey's `remote_decider`): dewey's sentence saying which one. The
+    /// person allows it (`retryPlan(rulesOnly: false, allowRemote: true)`) or plans without a model.
+    public var remoteServerQuestion: String? {
+        guard case .failed(.plan, .failed(code: "remote_decider", message: let message)) = state,
+              let first = message.split(separator: "\n").first else { return nil }
+        return first.prefix(1).uppercased() + first.dropFirst()  // the rest is how to allow it in Terminal
+    }
+
     public func start() {
         guard task == nil else { return }
         launch(scanFirst: true, rulesOnly: false)
     }
 
-    /// Plan again without scanning, after a failed or stopped plan.
-    public func retryPlan(rulesOnly: Bool) {
+    /// Plan again without scanning, after a failed or stopped plan. `allowRemote` is the person's yes
+    /// to `remoteServerQuestion`; dewey remembers it for this folder and server.
+    public func retryPlan(rulesOnly: Bool, allowRemote: Bool = false) {
         guard !isActive, scan != nil else { return }
-        launch(scanFirst: false, rulesOnly: rulesOnly)
+        launch(scanFirst: false, rulesOnly: rulesOnly, allowRemote: allowRemote && !rulesOnly)
     }
 
     /// Scan and plan again from the start.
@@ -86,15 +96,15 @@ public final class ScanPlanSession {
     /// Wait for the current run to end (for tests and for quitting).
     public func wait() async { await task?.value }
 
-    private func launch(scanFirst: Bool, rulesOnly: Bool) {
+    private func launch(scanFirst: Bool, rulesOnly: Bool, allowRemote: Bool = false) {
         self.rulesOnly = rulesOnly
         endedAt = nil
         startedAt = .now
         state = .running(scanFirst ? .scan : .plan)
-        task = Task { await self.perform(scanFirst: scanFirst, rulesOnly: rulesOnly) }
+        task = Task { await self.perform(scanFirst: scanFirst, rulesOnly: rulesOnly, allowRemote: allowRemote) }
     }
 
-    private func perform(scanFirst: Bool, rulesOnly: Bool) async {
+    private func perform(scanFirst: Bool, rulesOnly: Bool, allowRemote: Bool) async {
         if scanFirst {
             do {
                 try Task.checkCancellation()
@@ -113,7 +123,8 @@ public final class ScanPlanSession {
         state = .running(.plan)
         do {
             try Task.checkCancellation()
-            plan = try await cli.run(["plan", root] + (rulesOnly ? ["--backend", "none"] : []),
+            plan = try await cli.run(["plan", root] + (rulesOnly ? ["--backend", "none"] : [])
+                                         + (allowRemote ? ["--allow-remote"] : []),
                                      as: PlanResult.self) { e in await self.receive(e) }
             progress.finish(Self.planPhases, ok: true)
             state = .finished

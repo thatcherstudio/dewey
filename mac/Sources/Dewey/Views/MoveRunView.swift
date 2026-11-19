@@ -77,7 +77,8 @@ struct MoveRunView: View {
             Spacer()
             if let batch {
                 Button(run.value == nil ? "Undo These Moves…" : "Undo This Batch…") {
-                    undoRequest = UndoRequest(batch: batch, what: run.value?.movedText, newerBatch: false)
+                    undoRequest = UndoRequest(batch: batch, what: run.value?.movedText, newerBatch: false,
+                                              from: folder.status?.batches.first { $0.batch == batch }?.destOutside)
                 }
             }
             Button("Done") { folder.dismissMoves() }
@@ -238,6 +239,8 @@ struct UndoRequest: Identifiable {
     let what: String?
     /// A newer batch still has files out: undoing this one first can leave some where they are.
     let newerBatch: Bool
+    /// Where the batch filed things, when that is outside the folder: they come back from there.
+    var from: String?
     var id: String { batch }
 }
 
@@ -254,6 +257,8 @@ extension View {
         } message: { r in
             Text("They go back to where they were before this batch. A file changed since it moved stays where it "
                  + "is now, and folders Dewey made for them are removed if they're empty."
+                 + (r.from.map { "\n\nThis batch filed them into \(($0 as NSString).abbreviatingWithTildeInPath), "
+                                 + "outside this folder. They come back from there." } ?? "")
                  + (r.newerBatch ? "\n\nA newer batch hasn't been undone. If it moved the same files, undo it first." : ""))
         }
     }

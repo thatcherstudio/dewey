@@ -9,13 +9,14 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import extract
-from .config import STATE_DIRNAME
+from .config import STATE_DIRNAME, make_state_dir
 from .errors import CONFIG, UNSAFE_ROOT, DeweyExit
 from .progress import Progress, human_bytes, say
 
@@ -87,8 +88,21 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _private(db: Path) -> None:
+    """The catalog holds file names and text previews: readable by its owner only. SQLite gives the
+    -wal and -shm files beside it the same permissions as the catalog."""
+    try:
+        os.close(os.open(db, os.O_RDWR | os.O_CREAT, 0o600))
+        for p in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+            if p.exists() and stat.S_IMODE(p.stat().st_mode) & 0o077:
+                os.chmod(p, 0o600)
+    except OSError:  # a disk without permissions, or a catalog that isn't ours: sqlite says what's wrong
+        pass
+
+
 def open_db(state_dir: Path) -> sqlite3.Connection:
-    state_dir.mkdir(parents=True, exist_ok=True)
+    make_state_dir(state_dir)
+    _private(state_dir / "catalog.db")
     conn = sqlite3.connect(state_dir / "catalog.db")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

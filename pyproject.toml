@@ -9,10 +9,11 @@ requires-python = ">=3.11"
 dependencies = []          # core is stdlib-only
 
 [project.optional-dependencies]
-pdf = ["pypdf>=4"]
+# pypdf reads files from anywhere: 6.21.4 has the fixes for crafted PDFs that hang or eat memory.
+pdf = ["pypdf>=6.21.4"]
 photos = ["Pillow>=10", "pillow-heif>=0.16"]
 fast = ["blake3>=0.4"]
-all = ["pypdf>=4", "Pillow>=10", "pillow-heif>=0.16", "blake3>=0.4"]
+all = ["pypdf>=6.21.4", "Pillow>=10", "pillow-heif>=0.16", "blake3>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/thatcherstudio/dewey"

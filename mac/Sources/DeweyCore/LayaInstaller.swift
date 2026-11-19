@@ -78,8 +78,20 @@ public final class LayaInstaller {
     }
 
     public nonisolated static let pythonVersion = "3.11"
-    /// The same package the README installs.
-    public nonisolated static let package = "laya[serve]"
+
+    // What Install Laya downloads is fixed here, so the button installs what this version of the app
+    // was tried with and not whatever was published this morning. To move to a newer Laya, change
+    // all three together and run a real install.
+    /// The release of the package the README installs.
+    public nonisolated static let layaVersion = "0.4.37"
+    public nonisolated static let package = "laya[serve]==\(layaVersion)"
+    /// Laya's own dependencies (PyTorch, transformers, FastAPI…) as they were on this day: nothing
+    /// uploaded to PyPI later is installed (uv's --exclude-newer). Later than the Laya release above.
+    public nonisolated static let packagesAsOf = "2026-11-19T00:00:00Z"
+    /// The commit of the model on Hugging Face: the one Laya \(layaVersion) lists as reviewed
+    /// (`laya/revisions.py`, PINNED_REVISIONS), which is what LAYA_REVISION=reviewed in the wrapper
+    /// makes laya-serve load. A commit names its files exactly; "main" names whatever is newest.
+    public nonisolated static let modelRevision = "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851"
 
     public private(set) var state: State = .idle
     /// 0...1 across all three steps.
@@ -235,7 +247,8 @@ public final class LayaInstaller {
             try await measured(step, dirs: [layout.cache]) {
                 try await self.exec(uv, ["venv", self.layout.venv.path, "--python", Self.pythonVersion, "--clear"],
                                     env: self.uvEnvironment)
-                try await self.exec(uv, ["pip", "install", "--python", python.path, Self.package],
+                try await self.exec(uv, ["pip", "install", "--python", python.path, Self.package,
+                                         "--exclude-newer", Self.packagesAsOf],
                                     env: self.uvEnvironment)
             }
             guard ToolLocator.isExecutable(layout.venv.appending(path: "bin/laya-serve")) else {
@@ -243,7 +256,8 @@ public final class LayaInstaller {
             }
         case .model:
             model = ModelProgress()
-            try await exec(layout.venv.appending(path: "bin/python"), ["-I", "-c", Self.modelScript],
+            try await exec(layout.venv.appending(path: "bin/python"),
+                           ["-I", "-c", Self.modelScript, Self.modelRevision],
                            env: modelEnvironment) { line in
                 guard self.model.read(line) else { return false }
                 self.stepTotal = self.model.total
@@ -344,6 +358,9 @@ public final class LayaInstaller {
             # this one. Deleting \(layout.root.path) removes Laya and the model.
             export HF_HOME=\(q(layout.huggingface.path))
             export HF_HUB_DISABLE_TELEMETRY=1
+            # Load the model commit this Laya lists as reviewed (the one Install Laya downloaded),
+            # not whatever is newest on Hugging Face.
+            export LAYA_REVISION="${LAYA_REVISION:-reviewed}"
             exec \(q(layout.venv.appending(path: "bin/laya-serve").path)) "$@"
 
             """
@@ -391,16 +408,17 @@ public final class LayaInstaller {
     // MARK: - model download
 
     /// Downloads exactly what laya-serve loads for `english` (laya's `Agent.__init__`: the repo's root
-    /// checkpoint, filtered to these patterns, default revision) and prints JSON lines for the progress
+    /// checkpoint, filtered to these patterns, at the commit given as its argument) and prints JSON lines for the progress
     /// bar: `{"total": bytes}` first, then `{"bar": id, "bytes": n}` from huggingface_hub's byte
     /// counters, and `{"path": snapshot}` at the end. Xet writes the file only at the end, so the bytes
     /// have to come from those counters rather than from the folder.
     static let modelScript = #"""
-        import fnmatch, json, os, time
+        import fnmatch, json, os, sys, time
         from huggingface_hub import HfApi, snapshot_download
         from tqdm import tqdm
 
         REPO = "convaiinnovations/laya"
+        REVISION = sys.argv[1]
         PATTERNS = ["rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*"]
         DEVNULL = open(os.devnull, "w")
 
@@ -426,9 +444,9 @@ public final class LayaInstaller {
                     say(bar=id(self), bytes=int(self.n))
                 super().close()
 
-        info = HfApi().model_info(REPO, files_metadata=True)
+        info = HfApi().model_info(REPO, revision=REVISION, files_metadata=True)
         say(total=sum(s.size or 0 for s in info.siblings if any(fnmatch.fnmatch(s.rfilename, p) for p in PATTERNS)))
-        say(path=snapshot_download(REPO, allow_patterns=PATTERNS, tqdm_class=Report))
+        say(path=snapshot_download(REPO, revision=REVISION, allow_patterns=PATTERNS, tqdm_class=Report))
         """#
 
     /// Reads the model script's JSON lines.

@@ -24,7 +24,7 @@ venv)
     mkdir -p "$2/bin"
     cat > "$2/bin/python" <<'PY'
 #!/bin/sh
-echo "python $1 | hf=$HF_HOME" >> "$(dirname "$HF_HOME")/calls.log"
+echo "python $1 rev=$4 | hf=$HF_HOME" >> "$(dirname "$HF_HOME")/calls.log"
 echo '{"total": 2000}'
 echo '{"bar": 1, "bytes": 500}'
 echo '{"bar": 2, "bytes": 2000}'
@@ -42,7 +42,7 @@ pip)
     mkdir -p "$UV_CACHE_DIR"
     head -c 3000 /dev/zero > "$UV_CACHE_DIR/wheel"
     venv="$(dirname "$(dirname "$4")")"
-    printf '#!/bin/sh\necho "HF_HOME=$HF_HOME args=$*"\n' > "$venv/bin/laya-serve"
+    printf '#!/bin/sh\necho "HF_HOME=$HF_HOME rev=$LAYA_REVISION args=$*"\n' > "$venv/bin/laya-serve"
     chmod 755 "$venv/bin/laya-serve"
     echo "Installed 1 package" >&2 ;;
 esac
@@ -81,14 +81,17 @@ struct LayaInstallerTests {
         let env = "pref=only-managed noconfig=1 cache=\(layout.cache.path) venv="
         #expect(calls.contains("uv python install 3.11 --no-bin | \(env)"))
         #expect(calls.contains("uv venv \(layout.venv.path) --python 3.11 --clear | \(env)"))
-        #expect(calls.contains("uv pip install --python \(layout.venv.path)/bin/python laya[serve] | \(env)"))
-        #expect(calls.contains("python -I | hf=\(layout.huggingface.path)"))
+        // pinned: this release of Laya, its dependencies as of a day, and one commit of the model
+        #expect(calls.contains("uv pip install --python \(layout.venv.path)/bin/python laya[serve]==0.4.37 "
+                               + "--exclude-newer 2026-11-19T00:00:00Z | \(env)"))
+        #expect(calls.contains("python -I rev=55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851 | hf=\(layout.huggingface.path)"))
+        #expect(LayaInstaller.modelScript.contains("revision=REVISION, allow_patterns=PATTERNS"))
         #expect(installer.stepTotal == 2000 && installer.stepBytes == 2000, "the model step reads the script's bytes")
         #expect(installer.log.contains("Warning: You are sending unauthenticated requests to the HF Hub."))
         #expect(!installer.log.contains { $0.hasPrefix("{") }, "the script's JSON lines aren't log lines")
 
         #expect(ToolLocator.isExecutable(layout.layaServe))
-        #expect(try run(layout.layaServe, ["--x"]) == "HF_HOME=\(layout.huggingface.path) args=--x\n")
+        #expect(try run(layout.layaServe, ["--x"]) == "HF_HOME=\(layout.huggingface.path) rev=reviewed args=--x\n")
         #expect(!FileManager.default.fileExists(atPath: layout.cache.path), "uv's cache goes once it's installed")
         let backup = try layout.root.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup
         #expect(backup == true)
@@ -241,7 +244,7 @@ struct InstalledLayaLocatorTests {
         #expect(await locator.locate(.layaServe) == installed.appending(path: "laya-serve"))
         #expect(await locator.locate(.uv) == bundled.appending(path: "uv"))
         #expect(!locator.candidates(for: .uv).contains { $0.path.contains(".venvs") })
-        #expect(SetupCommands.installLaya.contains("uv pip install --python ~/.venvs/laya/bin/python 'laya[serve]'"))
+        #expect(SetupCommands.installLaya.contains("uv pip install --python ~/.venvs/laya/bin/python 'laya[serve]==0.4.37'"))
     }
 }
 

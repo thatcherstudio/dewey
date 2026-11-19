@@ -11,19 +11,27 @@ Backends
              LM Studio, vLLM). Parses JSON from the reply. Confidence is self-reported and
              uncalibrated, so by default it is capped below the auto threshold.
   none       Rules only. Everything the rules don't claim is left in place.
+
+What leaves the Mac: nothing, with the default url (127.0.0.1). A url on another machine gets each
+file's name and text preview, so `make` says so every time. DEWEY_API_KEY goes only to this Mac or
+over https, a request to this Mac never goes through a proxy, and redirects aren't followed (the
+key and the request would go wherever the server pointed).
 """
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
 from .errors import CONFIG, DeweyExit
+from .progress import say
 
 
 class DecisionError(RuntimeError):
@@ -39,20 +47,54 @@ class Decision:
     note: str = ""
 
 
+def host_of(url: str) -> str:
+    return urllib.parse.urlsplit(str(url)).hostname or ""
+
+
+def is_local(url: str) -> bool:
+    """The url names this Mac itself: localhost or a loopback address."""
+    host = host_of(url)
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def sends_key(url: str) -> bool:
+    return is_local(url) or str(url).startswith("https://")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # the 3xx comes back as an HTTPError
+
+
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)  # this Mac: no proxy in between
+_OUT = urllib.request.build_opener(_NoRedirect)
+
+
 def _post(url: str, body: dict, timeout: float, retries: int = 1) -> dict:
     data = json.dumps(body).encode()
     headers = {"Content-Type": "application/json"}
     key = os.environ.get("DEWEY_API_KEY")
-    if key:
+    if key and sends_key(url):
         headers["Authorization"] = f"Bearer {key}"
+    opener = _DIRECT if is_local(url) else _OUT
     last = None
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
+            try:
+                detail = e.read(2000).decode(errors="replace")[:500]
+            except (OSError, http.client.HTTPException):  # the server hung up after the status line
+                detail = ""
+            if 300 <= e.code < 400:
+                detail = f"it sent dewey on to {e.headers.get('Location', 'another address')}; dewey doesn't follow"
             raise DecisionError(f"HTTP {e.code} from {url}: {detail}") from None
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError) as e:
             last = e
@@ -70,7 +112,7 @@ def _unreadable(resp, e: Exception) -> DecisionError:
     return DecisionError(f"couldn't read the response ({type(e).__name__}: {e}): {json.dumps(resp)[:300]}")
 
 
-def _check_url(url) -> str:
+def check_url(url) -> str:
     url = str(url)
     if not url.startswith(("http://", "https://")):
         raise DeweyExit(f"decider url must start with http:// or https:// (got {url!r})", CONFIG)
@@ -215,12 +257,18 @@ def make(cfg: dict, backend_override: str | None = None):
     backend = backend_override or d["backend"]
     if backend == "none":
         return NoDecider()
+    if backend not in ("systemone", "chat"):
+        raise DeweyExit(f"unknown decider backend: {backend}", CONFIG)
+    url = check_url(d["url"])
+    if not is_local(url):
+        say(f"note: the decision model is at {host_of(url)}, not on this Mac ([decider] url). "
+            "Each file's name and a short preview of its text are sent there.")
+        if os.environ.get("DEWEY_API_KEY") and not sends_key(url):
+            say("note: DEWEY_API_KEY is not sent over plain http to another machine. Use an https:// url.")
     if backend == "systemone":
-        return SystemOneDecider(_check_url(d["url"]), d["model"], float(d["timeout"]))
-    if backend == "chat":
-        cap = None if d.get("trust_chat_confidence") else max(0.0, float(cfg["plan"]["auto_confidence"]) - 0.01)
-        return ChatDecider(_check_url(d["url"]), d["model"], float(d["timeout"]), cap)
-    raise DeweyExit(f"unknown decider backend: {backend}", CONFIG)
+        return SystemOneDecider(url, d["model"], float(d["timeout"]))
+    cap = None if d.get("trust_chat_confidence") else max(0.0, float(cfg["plan"]["auto_confidence"]) - 0.01)
+    return ChatDecider(url, d["model"], float(d["timeout"]), cap)
 
 
 PROBE_STATE = {"file_name": "Chase_Statement_2024-03.pdf", "folder": "Downloads", "extension": ".pdf",

@@ -62,6 +62,7 @@ struct ApplyView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Each move is logged as it happens. If anything looks wrong afterwards, History puts them all back."
+                 + (apply.preview?.leavesFolderFor.map { "\n\nThey go to \($0), outside this folder." } ?? "")
                  + (apply.previewIncludesReview && reviewCount > 0
                     ? "\n\nIncludes \(ProgressText.count(reviewCount)) \(reviewCount == 1 ? "row" : "rows") still "
                         + "marked Review." : ""))
@@ -118,6 +119,10 @@ struct ApplyView: View {
                 }
             }
             if let p = apply.preview {
+                if let dest = p.leavesFolderFor {
+                    Notice(systemImage: "arrow.up.forward.square", tint: .orange,
+                           text: "This plan files things into \(dest), outside this folder (Organize into, in Settings).")
+                }
                 summary(p)
                 if !p.refused.isEmpty { refused(p) }
             }

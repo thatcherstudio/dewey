@@ -12,6 +12,12 @@ before deleting the source when crossing volumes, and never deletes anything els
 Paths: a plan and a journal belong to the folder, not to where the folder was that day. Both keep
 paths relative to it, so a folder that was renamed, copied or mounted under another name applies
 and undoes inside itself. Only a plan.dest outside the folder stays where it was.
+
+Trust: a .dewey folder can arrive with the folder (a zip, a shared drive), plan, journal and all,
+and so can links inside the folder. So nothing in them is believed about where files may go: every
+move starts inside the folder and ends inside the destination with links followed (`Fence`), and a
+destination outside the folder is never the Library, a system folder or anything hidden. Undo
+takes something back from outside only when it is the very thing dewey moved (hash, or inode).
 """
 from __future__ import annotations
 
@@ -29,8 +35,8 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from . import macos
-from .catalog import hash_file, now_iso
-from .errors import BAD_EDIT, NO_PLAN, NOTHING_TO_UNDO, STALE, DeweyExit
+from .catalog import hash_file, now_iso, unsafe_root
+from .errors import BAD_EDIT, NO_PLAN, NOTHING_TO_UNDO, STALE, UNSAFE_DEST, DeweyExit
 from .planner import CSV_FIELDS, DECIDER_PREFIXES, norm_key, plan_files
 from .progress import Progress, human_bytes, say
 
@@ -179,6 +185,69 @@ def _moved_with(path: Path, was: Path, now: Path) -> Path:
         return path
 
 
+def _under(path: str, base: str) -> bool:
+    return path == base or path.startswith(base.rstrip("/") + "/")
+
+
+class Fence:
+    """Keeps moves between a folder and its destination, whatever a plan, a journal or a link says."""
+
+    def __init__(self, root: Path, dest_root: Path):
+        self.root, self.dest_root = root, dest_root
+        self._root, self._dest = os.path.realpath(root), os.path.realpath(dest_root)
+        self.outside = not _under(self._dest, self._root)  # files leave the folder
+        self._real: dict[str, str] = {}
+
+    def _realdir(self, d: Path, fresh: bool) -> str:
+        key = str(d)
+        if fresh or key not in self._real:  # fresh: during a batch, folders appear as it goes
+            self._real[key] = os.path.realpath(d)
+        return self._real[key]
+
+    def dest_problem(self) -> str | None:
+        """Why nothing may be filed into this destination at all."""
+        why = unsafe_root(Path(self._dest)) if self.outside else None
+        return f"{self.dest_root} is no place to file into: {why}" if why else None
+
+    def problem(self, in_folder: str, in_dest: str, fresh: bool = False) -> str | None:
+        """Why a move between these two relative paths (either direction) isn't allowed, or None."""
+        if not _is_rel(in_folder):
+            return "its path in this folder isn't a path inside it"
+        if not _is_rel(in_dest):
+            return "its path in the destination isn't a path inside it"
+        if not _under(self._realdir((self.root / in_folder).parent, fresh), self._root):
+            return "a link in this folder leads out of it on the way"
+        there = self._realdir((self.dest_root / in_dest).parent, fresh)
+        if not _under(there, self._dest):
+            return "a link in the destination leads out of it on the way (to file somewhere else, set plan.dest)"
+        if self.outside:
+            if any(part.startswith(".") for part in PurePosixPath(in_dest).parts):
+                return "its place in the destination is hidden, and outside this folder"
+            why = unsafe_root(Path(there))
+            if why:
+                return f"its place in the destination is {there}: {why}"
+        return None
+
+    def made_here(self, d: Path) -> bool:
+        """`d` is somewhere apply could have made a folder: undo may remove it if it is empty."""
+        try:
+            inside = d.relative_to(self.dest_root).as_posix()
+        except ValueError:
+            return False
+        return inside != "." and self.problem("x", f"{inside}/x", fresh=True) is None
+
+
+def _is_what_moved(rec: dict, st: os.stat_result, path: Path) -> bool:
+    """`path`, outside the folder, is the very file or folder this journal entry says dewey put there.
+    A file by its contents; a folder (moved by rename, which keeps both) by its inode and creation
+    time. Nobody who wrote a journal by hand knows those of somebody else's folder."""
+    if stat.S_ISREG(st.st_mode) and rec.get("algo") in ("sha256", "blake3") and isinstance(rec.get("hash"), str):
+        return st.st_size == rec.get("size") and hash_file(str(path), rec["algo"]) == rec["hash"]
+    if not isinstance(rec.get("inode"), int) or st.st_ino != rec["inode"]:
+        return False
+    return rec.get("born") is None or rec["born"] == getattr(st, "st_birthtime", None)
+
+
 def plan_root(conn, plan) -> Path | None:
     """The folder a plan was made for, as it was called that day."""
     was = plan["root"]
@@ -255,8 +324,9 @@ class Resolution:
     hard: bool = False  # refused whatever the status says (src edited, unknown status)
 
 
-def resolve_row(r, e: dict | None, cats: dict, homes: dict, dest_root: Path, root: Path) -> Resolution:
+def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Resolution:
     """One plan row (`plan_rows`) plus its CSV line (None = deleted). Shared by apply and `dewey rows`."""
+    dest_root, root = fence.dest_root, fence.root
     status = (e.get("status") or "").strip().lower() if e else "skip"
     dst = (e.get("dst") or "").strip() if e else r["dst"]
     category = (e.get("category") or "").strip() if e else r["category"]
@@ -285,6 +355,9 @@ def resolve_row(r, e: dict | None, cats: dict, homes: dict, dest_root: Path, roo
                           f"dst {dst!r} must be a relative path inside the destination root")
     if norm_key(dst) == norm_key(r["src"]) and dest_root == root:
         return Resolution(status, dst, category, "noop")
+    why = fence.problem(r["src"], dst)
+    if why:
+        return Resolution(status, dst, category, "refused", why)
     return Resolution(status, dst, category, "move")
 
 
@@ -298,6 +371,11 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     was = plan_root(conn, plan)
     if was and not _same_folder(was, root):
         say(f"note: plan {pid} was made when this folder was at {was}. It is applied here, in {root}.")
+    fence = Fence(root, dest_root)
+    if fence.dest_problem():
+        raise DeweyExit(f"plan {pid}: {fence.dest_problem()}", UNSAFE_DEST)
+    if fence.outside:
+        say(f"note: plan {pid} files things into {dest_root}, outside this folder.")
     cats = cfg["categories"]
     homes = _homes(cfg)
     db_rows = {r["row"]: r for r in conn.execute("SELECT * FROM plan_rows WHERE plan_id=?", (pid,))}
@@ -310,7 +388,7 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     for rowno in sorted(db_rows):
         r = db_rows[rowno]
         e = edits.get(rowno)
-        res = resolve_row(r, e, cats, homes, dest_root, root)
+        res = resolve_row(r, e, cats, homes, fence)
         if res.hard:
             refused.append((r, res.why))
             continue
@@ -345,6 +423,7 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
             say(f"  … {len(selected) - 40:,} more")
         say("Dry run: nothing moved.")
         return dict(plan_id=pid, dry_run=True, bytes=total, refused=refused_items,
+                    dest_root=str(dest_root), dest_outside=fence.outside,
                     selected=[{"row": r["row"], "src": r["src"], "dst": dst, "status": status, "category": category,
                                "action": r["action"], "reason": r["reason"], "size": r["size"] or 0}
                               for r, status, dst, category in selected])
@@ -403,8 +482,14 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
                 skipped.append({"row": r["row"], "src": r["src"], "why": "dst is inside the folder itself"})
                 prog.update(1, size)
                 continue
+            why = fence.problem(r["src"], os.path.relpath(dst_abs, dest_root), fresh=True)  # as the disk is now
+            if why:
+                skipped.append({"row": r["row"], "src": r["src"], "why": why})
+                prog.update(1, size)
+                continue
             rec = {"op": "move", "kind": "folder" if is_dir else "file", "row": r["row"], "file_id": r["file_id"], "hash": r["hash"], "algo": algo,
-                   "size": size, "mtime_ns": st.st_mtime_ns, "from": str(src_abs), "to": str(dst_abs),
+                   "size": size, "mtime_ns": st.st_mtime_ns, "inode": st.st_ino, "born": getattr(st, "st_birthtime", None),
+                   "from": str(src_abs), "to": str(dst_abs),
                    "from_rel": r["src"], "to_rel": os.path.relpath(dst_abs, dest_root), "status": status,
                    "category": category, "decided_by": r["decided_by"], "confidence": r["confidence"],
                    "reason": r["reason"], "at": now_iso()}
@@ -569,6 +654,26 @@ def latest_batch(conn, state_dir: Path) -> str | None:
     return None
 
 
+def _batch_places(head: dict, root: Path) -> tuple[Path, Path]:
+    """(the folder when the batch ran, where the batch filed things as the folder is now)."""
+    text = lambda k: head[k] if isinstance(head.get(k), str) and head[k] else None
+    was_root = Path(text("root")) if text("root") else root
+    return was_root, _moved_with(Path(text("dest_root")), was_root, root) if text("dest_root") else root
+
+
+def batch_dest_outside(root: Path, state_dir: Path, batch: str) -> str | None:
+    """Where a batch filed things, when that is outside the folder (the app says so before an undo)."""
+    try:
+        with open(state_dir / "moves" / f"{batch}.jsonl", encoding="utf-8") as fh:
+            head = json.loads(fh.readline())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(head, dict) or head.get("op") != "batch":
+        return None
+    dest_root = _batch_places(head, root)[1]
+    return str(dest_root) if Fence(root, dest_root).outside else None
+
+
 def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | None = None) -> dict:
     batch = batch or latest_batch(conn, state_dir)
     if not batch:
@@ -588,14 +693,18 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     moves = [r for r in recs if r.get("op") == "move"]
     # The journal names both ends relative to the folder and to where it filed things, so they are
     # found again in a folder that was renamed, copied or mounted somewhere else since.
-    head = next((r for r in recs if r.get("op") == "batch"), {})
-    was_root = Path(head["root"]) if head.get("root") else root
-    dest_root = _moved_with(Path(head["dest_root"]), was_root, root) if head.get("dest_root") else root
+    was_root, dest_root = _batch_places(next((r for r in recs if r.get("op") == "batch"), {}), root)
     if not _same_folder(was_root, root):
         say(f"note: batch {batch} moved things when this folder was at {was_root}. It is undone here, in {root}.")
+    fence = Fence(root, dest_root)
+    if fence.dest_problem():
+        raise DeweyExit(f"batch {batch} says it filed things outside this folder, but {fence.dest_problem()}. "
+                        "Nothing was put back.", UNSAFE_DEST)
+    if fence.outside:
+        say(f"note: batch {batch} filed things into {dest_root}, outside this folder; they come back from there.")
     mkdirs = [d for d in (_moved_with(Path(r["path"]), was_root, root) for r in recs
                           if r.get("op") == "mkdir" and isinstance(r.get("path"), str))
-              if dest_root in d.parents]  # apply only ever made folders inside the destination
+              if fence.made_here(d)]  # apply only ever made folders inside the destination
     uj = Journal(state_dir / "moves" / f"{batch}.undo.jsonl")
     uj.write({"op": "undo", "batch": batch, "root": str(root), "dest_root": str(dest_root), "started": now_iso()})
     restored, skipped = 0, []
@@ -608,6 +717,11 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
             prog.update(1, size)
             continue
         src, dst = root / rec["from_rel"], dest_root / rec["to_rel"]
+        why = fence.problem(rec["from_rel"], rec["to_rel"], fresh=True)
+        if why:
+            skipped.append((str(dst), why))
+            prog.update(1, size)
+            continue
         if not os.path.lexists(dst):
             if not os.path.lexists(src):
                 skipped.append((str(dst), f"{'folder' if is_dir else 'file'} is at neither location"))
@@ -629,6 +743,12 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
                 skipped.append((str(dst), "no longer a folder; left where it is"))
                 prog.update(1, size)
                 continue
+            if fence.outside and not _is_what_moved(rec, os.lstat(dst), dst):
+                skipped.append((str(dst), "can't tell that this is the folder dewey moved"
+                                          + ("" if "inode" in rec else " (a batch from before 0.2.1)")
+                                          + "; left where it is"))
+                prog.update(1, size)
+                continue
             src.parent.mkdir(parents=True, exist_ok=True)
             try:
                 move_dir(dst, src)
@@ -644,8 +764,17 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
             prog.update(1, size)
             continue
         st = os.lstat(dst)
-        if st.st_size != size or (st.st_mtime_ns != rec.get("mtime_ns") and rec.get("algo")
-                                  and hash_file(str(dst), rec["algo"]) != rec["hash"]):
+        if not stat.S_ISREG(st.st_mode):
+            skipped.append((str(dst), "no longer a regular file; left where it is"))
+            prog.update(1, size)
+            continue
+        if fence.outside:  # from outside the folder, only the very file dewey moved comes back
+            if not _is_what_moved(rec, st, dst):
+                skipped.append((str(dst), "isn't the file dewey moved (or was modified since); left where it is"))
+                prog.update(1, size)
+                continue
+        elif st.st_size != size or (st.st_mtime_ns != rec.get("mtime_ns") and rec.get("algo")
+                                    and hash_file(str(dst), rec["algo"]) != rec["hash"]):
             skipped.append((str(dst), "file was modified after the move; left where it is"))
             prog.update(1, size)
             continue
@@ -711,10 +840,11 @@ def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, 
     data, _, csv_rows = read_plan_csv(csv_path)
     edits = edits_by_row(csv_rows)
     cats, homes = cfg["categories"], _homes(cfg)
+    fence = Fence(root, dest_root)
     rows = []
     for r in conn.execute("SELECT * FROM plan_rows WHERE plan_id=? ORDER BY row", (pid,)):
         e = edits.get(r["row"])
-        res = resolve_row(r, e, cats, homes, dest_root, root)
+        res = resolve_row(r, e, cats, homes, fence)
         typed = (res.status, (e.get("dst") or "").strip() if e else r["dst"],
                  (e.get("category") or "").strip() if e else r["category"])
         rows.append({"row": r["row"], "src": r["src"], "action": r["action"], "size": r["size"] or 0,

@@ -25,6 +25,13 @@ import Testing
         #expect(p.selected[1].reason == nil)
         #expect(p.selected[1].name == "Folder A")
         #expect(p.refused.first?.why.hasPrefix("category") == true)
+        #expect(p.leavesFolderFor == nil)  // a dewey before 0.2.1 doesn't say where things go
+
+        let out = try decode(#"""
+        {"plan_id": 1, "dry_run": true, "bytes": 0, "refused": [], "selected": [],
+         "dest_root": "/Volumes/Big/Sorted", "dest_outside": true}
+        """#, as: ApplyPreview.self)
+        #expect(out.leavesFolderFor == "/Volumes/Big/Sorted")
     }
 
     @Test func aMoveAndANothingToDoDecodeAlike() throws {
@@ -230,6 +237,35 @@ struct ApplyWithDeweyTests {
         let after = try await cli.run(["status", root.path], as: FolderStatus.self)
         #expect(after.batches.first?.out == 0)
         #expect(after.undoable == nil)
+    }
+
+    @Test func aPlanThatFilesOutsideTheFolderSaysSoAndItsFilesComeBack() async throws {
+        let (cli, root) = try await plannedFolder()
+        let dest = FileManager.default.temporaryDirectory.appending(path: "dewey-sorted-\(UUID().uuidString)")
+        defer { for url in [root, dest] { try? FileManager.default.removeItem(at: url) } }
+        _ = try await cli.run(["plan", root.path, "--backend", "none", "--dest", dest.path], as: PlanResult.self)
+
+        let apply = ApplyPlan(cli: cli, root: root.path)
+        await apply.refresh()
+        let preview = try #require(apply.preview)
+        #expect(preview.leavesFolderFor?.hasSuffix(dest.lastPathComponent) == true)
+
+        let move = CommandRun<ApplyResult>(cli: cli, arguments: try #require(apply.moveArguments()), phases: ["move"])
+        move.start()
+        await move.wait()
+        #expect(move.value?.counts.moved == 2)
+        #expect(FileManager.default.fileExists(atPath: dest.appending(path: "Installers/setup.dmg").path))
+
+        // History knows the batch went outside, so the undo dialog can say where things come back from
+        let status = try await cli.run(["status", root.path], as: FolderStatus.self)
+        let batch = try #require(status.batches.first)
+        #expect(batch.destOutside?.hasSuffix(dest.lastPathComponent) == true)
+        let undo = CommandRun<UndoResult>(cli: cli, arguments: ["undo", root.path, "--batch", batch.batch],
+                                          phases: ["undo"])
+        undo.start()
+        await undo.wait()
+        #expect(undo.value?.restored == 2)
+        #expect(exists(root, "setup.dmg"))
     }
 
     @Test func aRefusedRowIsListedAndDoesntMove() async throws {

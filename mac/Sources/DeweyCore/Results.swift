@@ -126,6 +126,8 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
         public var movedAt: String?
         /// Whole folders among the moves (dewey before the app's Phase 5 doesn't say: 0).
         public var folders: Int?
+        /// Where the batch filed things, when that is outside the folder (else nil).
+        public var destOutside: String?
 
         public var id: String { batch }
         /// "4 files and 2 folders".

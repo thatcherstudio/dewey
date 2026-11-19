@@ -35,7 +35,7 @@ mkdir -p ~/.local/bin && ln -sf ~/.venvs/dewey/bin/dewey ~/.local/bin/dewey
 
 # 2. the decision model: Laya (421M params, ~800 MB, runs on CPU or MPS)
 uv venv ~/.venvs/laya --python 3.11
-uv pip install --python ~/.venvs/laya/bin/python 'laya[serve]'
+uv pip install --python ~/.venvs/laya/bin/python 'laya[serve]==0.4.37'   # the release dewey was tried with
 LAYA_HOST=127.0.0.1 LAYA_MODELS=english ~/.venvs/laya/bin/laya-serve
     # own terminal tab; Ctrl-C stops it. Serves POST /v1/systemone on http://127.0.0.1:8000.
     # Settings are env vars only (no flags; `--help` just starts the server). Without LAYA_HOST it
@@ -111,7 +111,9 @@ Things worth knowing:
   `~/.local/bin`, Homebrew, then your shell's `PATH`), the model's URL, and whether Laya starts when
   Dewey opens.
 - **Install Laya** uses a copy of uv inside the app, and keeps everything in one folder, which Time
-  Machine skips because it downloads again. Cancelled or failed, it keeps what it downloaded, so
+  Machine skips because it downloads again. It installs one fixed release of Laya (0.4.37), its
+  dependencies as they were on the day that release was tried, and one fixed commit of the model:
+  what a build of the app was tested with, not whatever was published since. Cancelled or failed, it keeps what it downloaded, so
   the next try picks up from there. **Remove Laya…** on the Setup screen stops Laya and deletes
   that folder (1.7 GB); after an install that didn't finish, **Delete Downloaded Files…** frees
   what it got. In Terminal, run it as
@@ -136,6 +138,15 @@ pip install mlx-lm
 mlx_lm.server --model mlx-community/Qwen3-4B-Instruct-2507-4bit --port 8080
 dewey plan ~/Downloads --backend chat --url http://127.0.0.1:8080 --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
+
+**A model on another machine.** With the default url (`127.0.0.1`) nothing leaves your Mac. Point
+`[decider] url` at another machine and each file's name and a short preview of its text go there,
+and dewey says so on every run. Because a folder's own `.dewey/dewey.toml` can arrive with the
+folder (a zip, a shared drive), a server that only that file names is used after you allow it once
+for that folder: `dewey plan ROOT --allow-remote`, or **Allow and Plan** in the app. A `--url` you
+type, or a config file outside the folder (`--config`, `~/.config/dewey/dewey.toml`), needs no
+asking. `DEWEY_API_KEY`, if set, is sent as a Bearer token, and only to this Mac or over `https`.
+Requests to this Mac skip any proxy, and redirects aren't followed.
 
 **About Laya's accuracy.** Its model card describes it as a fast base to specialize, not a zero-shot
 decision engine, and the vendor's typed-decision score is in the mid-70s. Treat the confidence
@@ -224,6 +235,14 @@ refused (never mis-moved).
   you name. Only a `dest` outside the folder stays where it was.
 - **Undo** restores files to their exact original paths, skips any file that was modified after the
   move, and removes the folders the batch created (a lone `.DS_Store` from Finder counts as empty).
+- **Moves stay between the folder and its destination.** A plan, a journal or a link inside the
+  folder can't send a file anywhere else, or pull one in: every move is checked with links followed,
+  at the moment it happens. A destination outside the folder (`dest`) is said out loud before
+  anything moves, and is never your Library, a system folder or a hidden place. Undo brings a file
+  back from outside only if it is the very file dewey moved (same hash).
+- **`.dewey` is private.** The catalog holds file names and text previews, so the folder and the
+  catalog are readable by you only. `.env` files are never previewed, and a PDF over 64 MB isn't
+  opened for one.
 
 ## Tuning
 

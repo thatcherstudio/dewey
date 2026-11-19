@@ -26,8 +26,8 @@ import traceback
 from contextlib import closing
 from pathlib import Path
 
-from . import __version__, catalog, config, decide, extract, mover, planner, progress
-from .errors import BAD_EDIT, CONFIG, NO_CATALOG, NOT_A_FOLDER, DeweyExit
+from . import __version__, catalog, config, decide, extract, mover, planner, progress, remote
+from .errors import BAD_EDIT, CONFIG, NO_CATALOG, NOT_A_FOLDER, REMOTE_DECIDER, DeweyExit
 from .progress import emit, human_bytes, say
 
 PROTOCOL = 1  # bump when an event or result shape changes in a way the app must know about
@@ -47,6 +47,29 @@ def _ctx(args):
     return root, state, cfg, cfg_path
 
 
+def _may_send(args, root: Path, cfg: dict, cfg_path: Path | None) -> None:
+    """A server on another machine that only the folder's own settings name is used once the person
+    has allowed it (remote.py). Until then nothing is sent, not even the first test request."""
+    backend, url = args.backend or cfg["decider"]["backend"], str(cfg["decider"]["url"])
+    if backend not in ("systemone", "chat") or args.url or cfg_path is None:
+        return
+    decide.check_url(url)
+    if decide.is_local(url) or not remote.arrives_with(root, cfg_path) or remote.allowed(root, url):
+        return
+    if not args.allow_remote:
+        raise DeweyExit(
+            f"this folder's own settings send each file's name and a preview of its text to "
+            f"{decide.host_of(url)}, which isn't this Mac.\n"
+            f"If you set that up, run again with --allow-remote (asked once per folder). If you didn't, "
+            f"fix [decider] url in {cfg_path}, or plan with --backend none.", REMOTE_DECIDER)
+    remote.allow(root, url)
+
+
+def _decider(args, root: Path, cfg: dict, cfg_path: Path | None):
+    _may_send(args, root, cfg, cfg_path)
+    return decide.make(cfg, args.backend)
+
+
 def _need_catalog(state: Path, root_arg: str) -> None:
     if not (state / "catalog.db").exists():
         raise DeweyExit(f"no catalog yet at {state}; run `dewey scan {root_arg}`", NO_CATALOG)
@@ -54,7 +77,7 @@ def _need_catalog(state: Path, root_arg: str) -> None:
 
 def cmd_init(args):
     root, state, cfg, cfg_path = _ctx(args)
-    state.mkdir(parents=True, exist_ok=True)
+    config.make_state_dir(state)
     target = state / "dewey.toml"
     if target.exists() and not args.force:
         say(f"{target} already exists (use --force to overwrite)")
@@ -72,7 +95,7 @@ def cmd_doctor(args):
     extras = extract.capabilities()
     for name, ok in extras.items():
         say(f"  {'ok ' if ok else '-- '} {name}")
-    d = decide.make(cfg, args.backend)
+    d = _decider(args, root, cfg, cfg_path)
     ok, msg = decide.probe(d, cfg)
     say(("decider ok: " if ok else "decider FAILED: ") + msg)
     result = {"version": __version__, "python": sys.version.split()[0], "root": str(root), "state": str(state),
@@ -97,13 +120,15 @@ def cmd_scan(args):
 
 
 def cmd_plan(args):
-    root, state, cfg, _ = _ctx(args)
+    root, state, cfg, cfg_path = _ctx(args)
+    d = _decider(args, root, cfg, cfg_path)
     with closing(catalog.open_db(state)) as conn:
-        d = decide.make(cfg, args.backend)
         return planner.plan(conn, root, cfg, d, state)
 
 
 def cmd_run(args):
+    root, _, cfg, cfg_path = _ctx(args)
+    _may_send(args, root, cfg, cfg_path)  # asked before a long scan, not after it
     return {"scan": cmd_scan(args), "plan": cmd_plan(args)}
 
 
@@ -205,7 +230,8 @@ def status_data(conn, root: Path, state: Path) -> dict:
               "report": there(planner.plan_files(state, p["id"])[1]), "summary": json.loads(p["summary"] or "{}")}
              for p in conn.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 20")]
     batches = [{"batch": b["batch"], "moves": b["n"], "undone": b["u"] or 0, "plan_id": b["plan_id"],
-                "moved_at": b["moved_at"], "folders": b["f"] or 0}
+                "moved_at": b["moved_at"], "folders": b["f"] or 0,
+                "dest_outside": mover.batch_dest_outside(root, state, b["batch"])}
                for b in conn.execute("SELECT batch, COUNT(*) n, SUM(undone_at IS NOT NULL) u, MIN(plan_id) plan_id, "
                                      "MIN(moved_at) moved_at, SUM(EXISTS(SELECT 1 FROM plan_rows p WHERE "
                                      "p.plan_id = moves.plan_id AND p.row = moves.row AND p.action = 'folder')) f "
@@ -286,6 +312,9 @@ def _parser() -> argparse.ArgumentParser:
         p.add_argument("--backend", choices=["systemone", "chat", "none"], help="override [decider] backend")
         p.add_argument("--url", help="override [decider] url")
         p.add_argument("--model", help="override [decider] model")
+        p.add_argument("--allow-remote", action="store_true",
+                       help="let this folder's own dewey.toml use a decision model on another machine "
+                            "(file names and previews go there); remembered for the folder")
         if name != "doctor":
             p.add_argument("--dest", help="organize into this folder instead of inside ROOT")
     add("scan", cmd_scan, "catalog + hash")

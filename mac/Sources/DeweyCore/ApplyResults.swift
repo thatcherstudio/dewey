@@ -30,6 +30,16 @@ public struct ApplyPreview: Decodable, Sendable, Equatable {
     public var bytes: Int64
     public var selected: [Item]
     public var refused: [Refused]
+    /// Where the rows go (dewey before 0.2.1 doesn't say).
+    public var destRoot: String?
+    /// That place is outside the folder itself (plan.dest): the files leave it.
+    public var destOutside: Bool?
+
+    /// "~/Sorted" when the files leave the folder, for the screen to say so before they move.
+    public var leavesFolderFor: String? {
+        guard destOutside == true, let destRoot else { return nil }
+        return (destRoot as NSString).abbreviatingWithTildeInPath
+    }
 
     public var folders: Int { selected.reduce(0) { $0 + ($1.isFolder ? 1 : 0) } }
     public var files: Int { selected.count - folders }

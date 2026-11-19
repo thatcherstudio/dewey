@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import tomllib
 from pathlib import Path
@@ -253,6 +254,23 @@ def _merge(base: dict, over: dict) -> dict:
 
 def state_dir_for(root: Path, override: str | None = None) -> Path:
     return Path(override).expanduser().resolve() if override else root / STATE_DIRNAME
+
+
+def make_state_dir(state_dir: Path) -> None:
+    """Make the state folder, for its owner only: the catalog in it holds every file's name and a
+    preview of its text. A folder that was already there under another name (`--state`) keeps its
+    permissions; the catalog file itself is made private either way (catalog.open_db)."""
+    try:
+        state_dir.mkdir(parents=True, mode=0o700)
+        ours = True
+    except FileExistsError:
+        ours = state_dir.name == STATE_DIRNAME
+    try:
+        st = os.lstat(state_dir)
+        if ours and stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) & 0o077:
+            os.chmod(state_dir, 0o700)
+    except OSError:  # a disk without permissions (exFAT, some network shares)
+        pass
 
 
 def find_config(state_dir: Path, explicit: str | None) -> Path | None:
@@ -623,6 +641,8 @@ def write_settings(state_dir: Path, explicit: str | None, data, *, reset: bool =
     if to_app(_checked(text, target)) != to_app(cfg):  # the writer must give back exactly what it was given
         raise RuntimeError("the TOML writer didn't round-trip these settings; nothing was written")
 
+    if target.parent == state_dir:
+        make_state_dir(state_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
     backup = None
     if target.exists():

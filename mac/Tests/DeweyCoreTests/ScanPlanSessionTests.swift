@@ -3,12 +3,14 @@ import Testing
 @testable import DeweyCore
 
 /// A stand-in `dewey` for scan and plan. FAKE_DECIDER=down makes plan fail like a stopped Laya;
+/// FAKE_DECIDER=elsewhere makes it ask before using a server on another machine (--allow-remote);
 /// FAKE_SLOW=scan makes scan hash until it gets SIGINT.
 private let fakeDewey = #"""
 #!/bin/sh
 cmd="$1"
 backend=model
-for a in "$@"; do [ "$prev" = "--backend" ] && backend="$a"; prev="$a"; done
+allowed=no
+for a in "$@"; do [ "$prev" = "--backend" ] && backend="$a"; [ "$a" = "--allow-remote" ] && allowed=yes; prev="$a"; done
 case "$cmd" in
   scan)
     echo '{"event": "progress", "phase": "walk", "label": "Walking", "unit": "entries", "n": 0, "total": null, "bytes": 0, "total_bytes": null, "rate": 0, "elapsed": 0, "eta": null, "extra": "", "done": false}'
@@ -24,6 +26,9 @@ case "$cmd" in
     if [ "$backend" = "none" ]; then
       echo '{"event": "log", "text": "rules only"}'
       echo '{"event": "result", "data": {"plan_id": 2, "csv": "/x/plan-2.csv", "report": "/x/report-2.md", "summary": {"auto": {"n": 1, "bytes": 10}}}}'
+    elif [ "$FAKE_DECIDER" = "elsewhere" ] && [ "$allowed" = "no" ]; then
+      printf '%s\n' '{"event": "error", "code": "remote_decider", "message": "this folder'"'"'s own settings send each file'"'"'s name and a preview of its text to models.example.com, which isn'"'"'t this Mac.\nIf you set that up, run again with --allow-remote."}'
+      exit 1
     elif [ "$FAKE_DECIDER" = "down" ]; then
       echo '{"event": "log", "text": "Decider FAILED: connection refused"}'
       echo '{"event": "error", "code": "decider", "message": "Start the decision model server"}'
@@ -95,6 +100,22 @@ struct ScanPlanSessionTests {
         #expect(s.progress.phase("decide")?.state == .skipped)
         #expect(s.progress.log.contains("rules only"))
         #expect(s.progress.log.filter { $0 == "Scan 1: 3 files" }.count == 1)  // scanned once
+    }
+
+    @Test func aServerOnAnotherMachineIsAskedAboutBeforePlanning() async throws {
+        let s = ScanPlanSession(cli: try fakeCLI(["FAKE_DECIDER": "elsewhere"]), root: "/x")
+        s.start()
+        await s.wait()
+        #expect(s.remoteServerQuestion == "This folder's own settings send each file's name and a preview of its "
+                + "text to models.example.com, which isn't this Mac.")
+        #expect(!s.needsModel)
+        #expect(s.scan != nil)
+
+        s.retryPlan(rulesOnly: false, allowRemote: true)  // the person's yes goes to dewey as --allow-remote
+        await s.wait()
+        #expect(s.state == .finished)
+        #expect(s.plan?.planId == 1)
+        #expect(s.remoteServerQuestion == nil)
     }
 
     @Test func waitsForALoadingModelBeforePlanning() async throws {

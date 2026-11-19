@@ -4,11 +4,17 @@ Everything here is best-effort and stdlib-first. Optional extras improve it:
   pypdf        -> PDF text      (pip install pypdf)
   Pillow       -> EXIF date/camera for JPEG/PNG/TIFF
   pillow-heif  -> EXIF for HEIC
+
+These files come from anywhere (a Downloads folder), so every reader takes a bounded bite: the
+first 16 KB of text, 200 KB of each Office part, two pages of a PDF no bigger than PDF_MAX_BYTES.
+pypdf is the one parser here that has had hangs and memory blow-ups on crafted files; pyproject.toml
+asks for a version with those fixed and with its own limits on what a stream may unpack to.
 """
 from __future__ import annotations
 
 import html
 import logging
+import os
 import re
 import zipfile
 from datetime import datetime
@@ -18,12 +24,13 @@ TEXT_EXTS = {
     ".toml", ".ini", ".cfg", ".conf", ".log", ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".zsh",
     ".bash", ".ps1", ".sql", ".html", ".htm", ".css", ".swift", ".go", ".rs", ".java", ".c", ".h",
     ".cpp", ".hpp", ".rb", ".php", ".r", ".ipynb", ".tex", ".srt", ".vtt", ".eml", ".ics", ".vcf",
-    ".rtf", ".svg", ".gpx", ".kml", ".env", ".properties",
-}
+    ".rtf", ".svg", ".gpx", ".kml", ".properties",
+}  # not .env: it holds passwords and keys, and the preview is stored and sent to the decider
 OOXML = {".docx": ["word/document.xml"],
          ".pptx": None,  # slides discovered dynamically
          ".xlsx": ["xl/sharedStrings.xml"]}
 EXIF_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".heif", ".webp"}
+PDF_MAX_BYTES = 64 * 1024 * 1024  # pypdf reads the whole file into memory, in every scan worker at once
 
 _ws = re.compile(r"\s+")
 _tags = re.compile(r"<[^>]+>")
@@ -98,6 +105,8 @@ def _read_ooxml(path: str, ext: str, limit: int) -> str | None:
 def _read_pdf(path: str, limit: int) -> str | None:
     if pypdf is None:
         return None
+    if os.path.getsize(path) > PDF_MAX_BYTES:
+        return "(large PDF; not opened for a preview)"
     reader = pypdf.PdfReader(path)
     if reader.is_encrypted:
         try:

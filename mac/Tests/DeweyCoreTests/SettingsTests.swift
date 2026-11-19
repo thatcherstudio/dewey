@@ -143,8 +143,33 @@ struct SettingsWithDeweyTests {
         await settings.reset()
         #expect(settings.file?.valid == true)
         #expect(settings.draft == settings.defaults)
-        #expect(settings.notice == "Back to the defaults. The old file is dewey.toml.bak.")
-        #expect(try String(contentsOf: root.appending(path: ".dewey/dewey.toml.bak"), encoding: .utf8) == "[plan\n")
+        let kept = try #require(settings.file?.kept)  // a file a person wrote: under a dated name, for good
+        let name = (kept as NSString).lastPathComponent
+        #expect(name.wholeMatch(of: /dewey\.toml\.\d{4}-\d\d-\d\d\.bak/) != nil)
+        #expect(settings.notice == "Back to the defaults. The old file is \(name).")
+        #expect(try String(contentsOfFile: kept, encoding: .utf8) == "[plan\n")
+    }
+
+    @Test func aFileAPersonWroteIsKeptForGoodWhenTheAppSavesOverIt() async throws {
+        let root = try tempFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let toml = root.appending(path: ".dewey/dewey.toml")
+        try FileManager.default.createDirectory(at: toml.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let mine = "# receipts go to Money\n[plan]\nmax_depth = 2\n"
+        try mine.write(to: toml, atomically: true, encoding: .utf8)
+        let settings = FolderSettings(cli: DeweyCLI(executable: realDewey!), root: root.path)
+        await settings.load()
+        settings.draft?.plan.maxDepth = 3
+        #expect(await settings.save())
+        let kept = try #require(settings.file?.kept)
+        #expect(settings.notice == "Saved. The dewey.toml you had is kept next to it as \((kept as NSString).lastPathComponent).")
+        for depth in [4, 5] {  // 0.2.0 kept one dewey.toml.bak: the second save replaced the person's file in it
+            settings.draft?.plan.maxDepth = depth
+            #expect(await settings.save())
+            #expect(settings.file?.kept == nil)
+            #expect(settings.notice == "Saved. The next Scan & Plan uses these settings.")
+        }
+        #expect(try String(contentsOfFile: kept, encoding: .utf8) == mine)
     }
 
     @Test func deweyRefusesWhatTheFormMissed() async throws {

@@ -13,12 +13,13 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
 import zipfile
-from contextlib import redirect_stderr
+from contextlib import closing, redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -541,6 +542,39 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("restored 1", out)
         self.assertEqual(snapshot(self.root), before)
         with self.assertRaises(SystemExit):                      # and now there's nothing left to undo
+            run("undo", R)
+
+    def test_an_undo_that_is_stopped_has_put_back_what_it_says(self):
+        from dewey import mover
+        before = snapshot(self.root)
+        R = str(self.root)
+        run("scan", R)
+        run("plan", R, "--url", self.url)
+        run("apply", R)
+        moved = snapshot(self.root)
+
+        def undone() -> int:
+            with closing(sqlite3.connect(self.state / "catalog.db")) as db:
+                return db.execute("SELECT COUNT(*) FROM moves WHERE undone_at IS NOT NULL").fetchone()[0]
+
+        real, calls = mover.move_file, []
+
+        def three_then_interrupt(*a, **kw):
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+            calls.append(a)
+            return real(*a, **kw)
+
+        with mock.patch.object(mover, "move_file", side_effect=three_then_interrupt):
+            with self.assertRaises(SystemExit) as cm:
+                out = run("undo", R)
+        self.assertEqual(cm.exception.code, 130)
+        self.assertNotIn(snapshot(self.root), (before, moved))
+        self.assertEqual(undone(), 3)  # 0.2.0: 0, so History said nothing had come back
+        out = run("undo", R)           # and the rest comes back the same way
+        self.assertNotIn("restored 0", out)
+        self.assertEqual(snapshot(self.root), before)
+        with self.assertRaises(SystemExit):
             run("undo", R)
 
     def test_failed_cross_volume_copy_leaves_no_partial(self):

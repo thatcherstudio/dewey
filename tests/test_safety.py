@@ -6,6 +6,7 @@ and a move to another disk keeps Finder tags and the creation date.
 """
 from __future__ import annotations
 
+import csv
 import errno
 import io
 import json
@@ -50,6 +51,55 @@ class Folder(unittest.TestCase):
         run("scan", R)
         run("plan", R, "--backend", "none", *extra)
         return R
+
+
+class OddNames(Folder):
+    def test_a_name_that_starts_or_ends_with_a_space_moves_as_it_is(self):
+        names = [" leading.zip", "trailing.zip ", " both .zip ", "plain.zip"]
+        for i, name in enumerate(names):
+            write(self.root / name, b"zip %d" % i)
+        R = str(self.root)
+        write(self.root / ".dewey" / "dewey.toml",  # "trailing.zip " has the extension ".zip ": no default rule
+              '[[rules]]\nname = "zips"\nname_regex = "zip"\ntarget = "Archives"\n')
+        run("scan", R)
+        run("plan", R, "--backend", "none")
+        code, events, _ = run_json("rows", R)
+        rows = {r["src"]: r for r in events[-1]["data"]["rows"]}
+        self.assertEqual(sorted(rows), sorted(names))
+        self.assertEqual({(r["verdict"], r["edited"]) for r in rows.values()}, {("move", False)}, rows)
+        out = run("apply", R)  # 0.2.0: "src was edited in the CSV" for the first three, and nothing moved
+        self.assertNotIn("edited", out)
+        self.assertEqual(files(self.root), sorted(f"Archives/{n}" for n in names))
+        run("undo", R)
+        self.assertEqual(files(self.root), sorted(names))
+
+    def test_spaces_typed_around_an_edit_still_dont_count(self):
+        write(self.root / " leading.zip", b"zip")
+        R = str(self.root)
+        run("scan", R)
+        run("plan", R, "--backend", "none")
+        csv_path, rows = read_plan(self.root / ".dewey")
+        rows[0].update(dst="  Old Zips/  ", status=" AUTO ")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        run("apply", R)
+        self.assertEqual(files(self.root), ["Old Zips/ leading.zip"])
+
+
+class BrokenSettings(Folder):
+    def test_things_come_back_whatever_state_the_settings_file_is_in(self):
+        R = self.planned()
+        run("apply", R)
+        for text in ('[plan]\ndest = "Sorted"\n',  # fine in 0.2.0, a config error since
+                     "[plan\n"):
+            write(self.root / ".dewey" / "dewey.toml", text)
+            with self.assertRaises(SystemExit) as cm:
+                run("status", R)
+            self.assertEqual(cm.exception.kind, "config")
+        self.assertIn("restored 2", run("undo", R))
+        self.assertEqual(files(self.root), ["one.zip", "two.zip"])
 
 
 class MovedOrCopiedFolder(Folder):

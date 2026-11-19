@@ -55,6 +55,12 @@ private func makeFake() throws -> DeweyCLI {
 private actor Collected {
     var events: [DeweyEvent] = []
     func add(_ e: DeweyEvent) { events.append(e) }
+
+    /// Wait until the fake has said something: by then its signal handlers are set. (A fixed sleep
+    /// wasn't always long enough on a busy Mac, and the Ctrl-C then ended the shell itself.)
+    func first() async throws {
+        while events.isEmpty { try await Task.sleep(for: .milliseconds(20)) }
+    }
 }
 
 @Suite(.timeLimit(.minutes(1)))
@@ -123,8 +129,9 @@ struct CLITests {
 
     @Test func cancellingTheTaskCancelsDewey() async throws {
         let cli = try makeFake()
-        let task = Task { try await cli.run(["slow"], as: Value.self) }
-        try await Task.sleep(for: .milliseconds(300))
+        let seen = Collected()
+        let task = Task { try await cli.run(["slow"], as: Value.self) { await seen.add($0) } }
+        try await seen.first()
         task.cancel()
         await #expect(throws: DeweyError.interrupted(batch: "b1")) { try await task.value }
     }
@@ -141,8 +148,9 @@ struct CLITests {
         #expect(await run.exitStatus() == SIGKILL)
         #expect(Date().timeIntervalSince(started) < 5)
 
-        let task = Task { try await cli.run(["stuck"], as: Value.self) }
-        try await Task.sleep(for: .milliseconds(300))
+        let seen = Collected()
+        let task = Task { [cli] in try await cli.run(["stuck"], as: Value.self) { await seen.add($0) } }
+        try await seen.first()
         task.cancel()
         await #expect(throws: DeweyError.crashed(status: SIGKILL, stderr: "")) { try await task.value }
     }

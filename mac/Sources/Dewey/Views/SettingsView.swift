@@ -585,7 +585,7 @@ private struct BrokenSettingsView: View {
             Button("Start Over") { Task { await settings.reset() } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The current file is kept next to it as dewey.toml.bak.")
+            Text("The current file is kept next to it, with today's date in its name.")
         }
     }
 

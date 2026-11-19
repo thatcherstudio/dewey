@@ -3,15 +3,33 @@ decision model's queue short (it only sees files no rule could place)."""
 from __future__ import annotations
 
 import re
+import string
 from dataclasses import dataclass
 from datetime import datetime
 
 from .errors import CONFIG, DeweyExit
 
+PLACEHOLDERS = ("review", "year", "month", "camera")  # what `fill` puts into a rule's target and reason
 
-class _Blank(dict):
-    def __missing__(self, key):
-        return ""
+
+def template_problem(text: str) -> str | None:
+    """Why a rule's target or reason can't be filled in, or None when it can.
+
+    Checked when the config loads: `Zips/{year` used to pass, then stop the plan half way with an
+    internal error, and `{yaer}` quietly became nothing, filing into the wrong folder."""
+    hint = "the placeholders are {review} {year} {month} {camera}; write {{ and }} for a real brace"
+    try:
+        fields = [(name, spec) for _, name, spec, _ in string.Formatter().parse(text) if name is not None]
+    except ValueError as e:  # a brace that is never closed, a lone }
+        return f"{e} ({hint})"
+    for name, spec in fields:
+        if name not in PLACEHOLDERS or "{" in (spec or ""):
+            return f"{{{name}{':' + spec if spec else ''}}} isn't something dewey fills in ({hint})"
+    try:
+        text.format_map(dict.fromkeys(PLACEHOLDERS, "2025"))
+    except (ValueError, LookupError, AttributeError, TypeError) as e:  # {year:d}, {year!x}
+        return f"{e} ({hint})"
+    return None
 
 
 @dataclass
@@ -45,6 +63,10 @@ class Rule:
 def compile_rules(cfg: dict) -> list[Rule]:
     out = []
     for r in cfg.get("rules", []):
+        for key in ("target", "reason"):
+            why = template_problem(r[key]) if key in r else None
+            if why:
+                raise DeweyExit(f"config: rule {r.get('name')!r}: {key} {r[key]!r} can't be filled in: {why}", CONFIG)
         try:
             out.append(Rule(
                 name=r["name"], target=r["target"], reason=r.get("reason", r["name"]),
@@ -81,8 +103,8 @@ def file_date(f) -> datetime:
 
 def fill(template: str, f, review_dir: str) -> str:
     d = file_date(f)
-    return template.format_map(_Blank(review=review_dir, year=f"{d.year:04d}", month=f"{d.month:02d}",
-                                      camera=f["camera"] or "")).strip("/")
+    return template.format_map(dict(review=review_dir, year=f"{d.year:04d}", month=f"{d.month:02d}",
+                                    camera=f["camera"] or "")).strip("/")
 
 
 def first_match(rules: list[Rule], f) -> Rule | None:

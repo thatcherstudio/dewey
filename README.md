@@ -101,8 +101,10 @@ Things worth knowing:
   or an external disk. A rebuilt app may ask again, because each build is signed ad hoc on your Mac.
   No Full Disk Access is needed.
 - **Settings saves only what differs from dewey's defaults**, so later improvements to the
-  defaults still reach you. Saving rewrites `dewey.toml` without your comments; the previous file is
-  kept as `dewey.toml.bak`. `dewey config ROOT` prints the same settings in Terminal.
+  defaults still reach you. Saving rewrites `dewey.toml` without your comments. A `dewey.toml` you
+  wrote or edited by hand is kept next to it first, as `dewey.toml.2026-11-19.bak` (the day it was
+  replaced), and no later save touches that copy. The app's own previous save is `dewey.toml.bak`.
+  `dewey config ROOT` prints the same settings in Terminal.
 - **The app's dewey is a copy made when you built it.** After `git pull`, run `make app` again. It
   works in Terminal too: `Dewey.app/Contents/Resources/bin/dewey`, which you can link into
   `~/.local/bin` to use as your `dewey`.
@@ -193,7 +195,8 @@ sqlite3 ~/Downloads/.dewey/catalog.db \
   A misspelled category is refused, so the row doesn't move. A `dst` ending in `/`, or naming a folder
   that exists, means "into that folder": `Data/Exports/` gives `Data/Exports/data.csv`.
   For a whole-folder row (`action` = `folder`), `category` can also be a kind from `[folders]` (`code`, `cad`, …).
-- Don't edit `src` or `row`. Rows with an edited `src` are refused.
+- Don't edit `src` or `row`. Rows with an edited `src` are refused. Spaces around what you type
+  don't count; a file whose own name starts or ends with a space keeps it.
 - `apply --dry-run` ends with an `--expect-sha` to copy. Given to the real `apply`, it moves those
   rows or, if the plan or a setting changed in between, nothing.
 
@@ -228,7 +231,8 @@ refused (never mis-moved).
   project folder (one containing `.git`, `package.json`, `pyproject.toml`, `Makefile`, …: see
   `project_markers`) are cataloged as one unit and never opened or split.
 - **Interrupted?** Each move is committed as it happens, and a batch stopped by a crash, Ctrl-C or a
-  closed terminal still shows up for a plain `dewey undo ROOT`. Ctrl-C during a scan or a plan
+  closed terminal still shows up for a plain `dewey undo ROOT`. An undo that is stopped has put
+  back what it says it has; run it again for the rest. Ctrl-C during a scan or a plan
   keeps the hashes and answers so far and exits at once, without waiting for a file it is stuck on.
 - **Never touched:** symlinks (recorded, not followed: no cycles, nothing outside the root),
   iCloud "Optimize Storage" placeholders (cataloged but not read, so a scan doesn't download your
@@ -243,7 +247,8 @@ refused (never mis-moved).
   app asks before it adds your whole home folder.
 - **The folder can move.** Plans and journals keep paths relative to the folder, so after you rename
   it, copy it, or plug its drive in under another name, `apply` and `undo` work inside the folder
-  you name. Only a `dest` outside the folder stays where it was.
+  you name. Only a `dest` outside the folder stays where it was. In `dewey.toml`, `dest` is a full
+  path (`/Volumes/…`, `~/…`); `--dest` in Terminal can be relative to where you are.
 - **Undo** restores files to their exact original paths, skips any file that was modified after the
   move, and removes the folders the batch created (a lone `.DS_Store` from Finder counts as empty).
 - **Moves stay between the folder and its destination.** A plan, a journal or a link inside the
@@ -262,6 +267,8 @@ refused (never mis-moved).
   folders you want taken apart.
 - **Rules first.** Anything you can say with an extension, a name regex or a path regex belongs in
   `[[rules]]`: it's instant, explainable and right every time. The model only sees what's left.
+  A rule's `target` and `reason` can use `{year}`, `{month}`, `{camera}` and `{review}`. Anything
+  else in braces (`{yaer}`, a brace never closed) is a config error as soon as the file is read.
 - **Folders (`[categories]`)** are what the model chooses between. 10–25 short, concrete descriptions
   work best. Laya's 512-token context holds the descriptions *and* the file summary, which is why
   `snippet_chars` defaults to 400.

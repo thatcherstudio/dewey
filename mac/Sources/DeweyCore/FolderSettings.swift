@@ -188,8 +188,11 @@ public struct SettingsFile: Decodable, Sendable, Equatable {
     public var raw: String?
     public var config: FolderConfig?
     public var defaults: FolderConfig
-    /// After a save: the previous file, kept as dewey.toml.bak.
+    /// After a save: where the file it replaced was kept (dewey.toml.bak, or `kept`).
     public var backup: String?
+    /// After a save that replaced a file a person wrote (comments, their own layout): the copy of it,
+    /// under a dated name that no later save replaces. nil when the file replaced was the app's own.
+    public var kept: String?
 }
 
 /// The Settings tab: the folder's settings, the changes made here, and Save.
@@ -264,7 +267,8 @@ public final class FolderSettings {
             self.draft = res.config
             self.base = res.config
             error = nil
-            notice = "Saved. The next Scan & Plan uses these settings."
+            notice = res.kept.map { "Saved. The dewey.toml you had is kept next to it as \(($0 as NSString).lastPathComponent)." }
+                ?? "Saved. The next Scan & Plan uses these settings."
             return true
         } catch DeweyError.failed(code: "stale", message: _) {
             saving = false
@@ -278,7 +282,7 @@ public final class FolderSettings {
         }
     }
 
-    /// Start over from dewey's defaults (a file dewey can't read is kept as dewey.toml.bak).
+    /// Start over from dewey's defaults (the file it replaces is kept next to it: see `SettingsFile.kept`).
     public func reset() async {
         guard !saving else { return }
         saving = true

@@ -18,6 +18,7 @@ import shutil
 import stat
 import tempfile
 import tomllib
+from datetime import datetime
 from pathlib import Path
 
 from .errors import CONFIG, STALE, DeweyExit
@@ -290,10 +291,7 @@ def load(state_dir: Path, explicit: str | None = None) -> tuple[dict, Path | Non
     path = find_config(state_dir, explicit)
     if path is None:
         return copy.deepcopy(DEFAULTS), None
-    cfg = _merge(DEFAULTS, _parse(path.read_bytes().decode("utf-8", errors="replace"), path))
-    check_types(cfg)
-    validate(cfg)
-    return cfg, path
+    return _checked(path.read_bytes().decode("utf-8", errors="replace"), path), path
 
 
 def _parse(text: str, path: Path) -> dict:
@@ -354,6 +352,13 @@ def check_types(cfg: dict) -> None:
                 raise DeweyExit(f"config: categories.{key}.{k} must be text, not {c[k]!r}", CONFIG)
 
 
+def _full_path(text: str) -> bool:
+    try:
+        return Path(text).expanduser().is_absolute()
+    except RuntimeError:  # ~someone who isn't a user of this Mac
+        return False
+
+
 def validate(cfg: dict) -> None:
     cats = cfg.get("categories") or {}
     if cfg["decider"]["backend"] != "none" and len(cats) < 2:
@@ -371,6 +376,10 @@ def validate(cfg: dict) -> None:
         raise DeweyExit("config: need 0 <= review_confidence <= auto_confidence <= 1", CONFIG)
     if p["keep_duplicate"] not in ("oldest", "newest", "shortest_path"):
         raise DeweyExit("config: plan.keep_duplicate must be oldest | newest | shortest_path", CONFIG)
+    if p["dest"] and not _full_path(p["dest"]):
+        raise DeweyExit(f"config: plan.dest must be a full path (one that starts with / or ~), not {p['dest']!r}. "
+                        "A relative one would be a different folder each time, depending on where dewey is "
+                        "started from.", CONFIG)
     if "" in cats:
         raise DeweyExit("config: a category needs a name (categories has an empty key)", CONFIG)
     if cfg["decider"]["backend"] not in ("systemone", "chat", "none"):
@@ -583,13 +592,46 @@ def _current(state_dir: Path, explicit: str | None) -> tuple[Path, Path | None, 
 
 
 def _checked(text: str, path: Path) -> dict:
-    from .rules import compile_rules  # a bad regex is a config error too
+    """The settings in `text`, or a config error: the one check every command and the app go through."""
+    from .rules import compile_rules  # a bad regex or a target that can't be filled in is a config error too
 
     cfg = _merge(DEFAULTS, _parse(text, path))
     check_types(cfg)
     validate(cfg)
     compile_rules(cfg)
     return cfg
+
+
+def _settings_text(cfg: dict) -> str:
+    """dewey.toml as the app saves it: the header, then only what differs from the defaults."""
+    body = dumps(changed_settings(cfg))
+    return SETTINGS_HEADER + ("\n" + body if body else "")
+
+
+def _app_made(data: bytes, path: Path) -> bool:
+    """This file is, to the byte, what the app saves for the settings in it. So nothing a person wrote
+    (comments, their own layout, the full file from `dewey init`) is lost when it is replaced."""
+    try:
+        text = data.decode("utf-8")
+        return text == _settings_text(_checked(text, path))
+    except (DeweyExit, UnicodeDecodeError, TypeError, ValueError):
+        return False
+
+
+def _keep(target: Path, data: bytes) -> Path:
+    """Copy a settings file a person wrote to a name no later save replaces (dewey.toml.2026-11-19.bak).
+
+    dewey.toml.bak is the previous save, and the next save replaces it: two saves from the app and a
+    hand-written dewey.toml was gone."""
+    day, n = datetime.now().strftime("%Y-%m-%d"), 1
+    while True:
+        kept = target.with_name(f"{target.name}.{day}{'' if n == 1 else f'-{n}'}.bak")
+        if not os.path.lexists(kept):
+            shutil.copy2(target, kept)
+            return kept
+        if kept.is_file() and kept.read_bytes() == data:  # the same file, kept earlier today
+            return kept
+        n += 1
 
 
 def _sha(path: Path) -> str | None:
@@ -615,7 +657,8 @@ def read_settings(state_dir: Path, explicit: str | None = None) -> dict:
 def write_settings(state_dir: Path, explicit: str | None, data, *, reset: bool = False,
                    expect_sha: str | None = None) -> dict:
     """Save the app's settings (any subset of sections) over the current ones, or over the defaults
-    with reset. Checked like a file dewey reads, written atomically, the old file kept as .bak."""
+    with reset. Checked like a file dewey reads, written atomically. The file it replaces is kept:
+    the app's own previous save as dewey.toml.bak, a file a person wrote under a dated name for good."""
     target, source, current = _current(state_dir, explicit)
     if target.is_symlink():  # a dotfiles link: write where it points, keep the link
         target = target.resolve()
@@ -627,27 +670,30 @@ def write_settings(state_dir: Path, explicit: str | None, data, *, reset: bool =
             base = _checked(current.decode("utf-8", errors="replace"), source)
         except DeweyExit as e:
             raise DeweyExit(f"{e.code}\nFix the file, or start over from the defaults "
-                            "(the old file is kept as dewey.toml.bak).", CONFIG) from None
+                            "(the old file is kept next to it).", CONFIG) from None
     cfg = _merge(base, from_app(data))
     check_types(cfg)
     validate(cfg)
     from .rules import compile_rules
     compile_rules(cfg)
     try:
-        body = dumps(changed_settings(cfg))
+        text = _settings_text(cfg)
     except (TypeError, ValueError) as e:
         raise DeweyExit(f"settings: {e}", CONFIG) from None
-    text = SETTINGS_HEADER + ("\n" + body if body else "")
     if to_app(_checked(text, target)) != to_app(cfg):  # the writer must give back exactly what it was given
         raise RuntimeError("the TOML writer didn't round-trip these settings; nothing was written")
 
     if target.parent == state_dir:
         make_state_dir(state_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
+    backup = kept = None
     if target.exists():
-        backup = target.with_name(target.name + ".bak")
-        shutil.copy2(target, backup)
+        was = target.read_bytes()
+        if _app_made(was, target):
+            backup = target.with_name(target.name + ".bak")
+            shutil.copy2(target, backup)
+        else:
+            backup = kept = _keep(target, was)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -659,4 +705,4 @@ def write_settings(state_dir: Path, explicit: str | None, data, *, reset: bool =
         Path(tmp).unlink(missing_ok=True)
         raise
     return {**read_settings(state_dir, explicit), "backup": str(backup) if backup else None,
-            "changed": list(changed_settings(cfg))}
+            "kept": str(kept) if kept else None, "changed": list(changed_settings(cfg))}

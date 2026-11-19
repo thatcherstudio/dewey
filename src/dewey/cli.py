@@ -35,14 +35,18 @@ from .progress import emit, human_bytes, say
 PROTOCOL = 1  # bump when an event or result shape changes in a way the app must know about
 
 
-def _ctx(args):
+def _where(args) -> tuple[Path, Path]:
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
         raise DeweyExit(f"not a folder: {root}", NOT_A_FOLDER)
-    state = config.state_dir_for(root, args.state)
+    return root, config.state_dir_for(root, args.state)
+
+
+def _ctx(args):
+    root, state = _where(args)
     cfg, cfg_path = config.load(state, args.config)
-    if getattr(args, "dest", None):
-        cfg["plan"]["dest"] = args.dest
+    if getattr(args, "dest", None):  # typed in a shell: relative to where the person is standing
+        cfg["plan"]["dest"] = os.path.abspath(os.path.expanduser(args.dest))
     for k in ("url", "model"):
         if getattr(args, k, None):
             cfg["decider"][k] = getattr(args, k)
@@ -144,7 +148,7 @@ def cmd_apply(args):
 
 
 def cmd_undo(args):
-    root, state, cfg, _ = _ctx(args)
+    root, state = _where(args)  # not _ctx: putting things back never waits for a dewey.toml to be fixed
     with closing(catalog.open_db(state)) as conn:
         return mover.undo(conn, root, state, args.batch)
 
@@ -342,7 +346,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--expect-sha", help="refuse if the CSV's sha256 isn't this (it changed since it was read)")
     p = add("config", cmd_config, "this folder's settings; --write saves new ones (for the Mac app)")
     p.add_argument("--write", action="store_true", help="save settings from JSON on stdin (only what differs "
-                   "from the defaults is written; the old file is kept as dewey.toml.bak)")
+                   "from the defaults is written; the old file is kept next to it as a .bak)")
     p.add_argument("--reset", action="store_true", help="with --write: start from the defaults, not the current file")
     p.add_argument("--expect-sha", help="with --write: refuse if dewey.toml's sha256 isn't this ('none': no file)")
     add("app-info", cmd_app_info, "version and app protocol (for the Mac app)", root=False)

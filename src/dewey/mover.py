@@ -324,13 +324,25 @@ class Resolution:
     hard: bool = False  # refused whatever the status says (src edited, unknown status)
 
 
+def _typed(e: dict | None, r, key: str) -> str:
+    """A cell of the CSV as the person left it: the plan's own value when they didn't change it.
+
+    Spaces around what they typed don't count. The plan's value is kept exactly as it is, because a
+    file can be named " notes.txt" or "report.txt ", and trimming that made dewey take the row for
+    an edited one (and refuse it, or rename the file on its way)."""
+    if e is None:
+        return r[key]
+    cell, planned = (e.get(key) or "").strip(), r[key] or ""
+    return planned if cell == planned.strip() else cell
+
+
 def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Resolution:
     """One plan row (`plan_rows`) plus its CSV line (None = deleted). Shared by apply and `dewey rows`."""
     dest_root, root = fence.dest_root, fence.root
     status = (e.get("status") or "").strip().lower() if e else "skip"
-    dst = (e.get("dst") or "").strip() if e else r["dst"]
-    category = (e.get("category") or "").strip() if e else r["category"]
-    if e and (e.get("src") or "").strip() != r["src"]:
+    dst = _typed(e, r, "dst")
+    category = _typed(e, r, "category")
+    if _typed(e, r, "src") != r["src"]:
         return Resolution(status, dst, category, "refused", "src was edited in the CSV; edit dst instead", True)
     if status not in ("auto", "review", "skip"):
         return Resolution(status, dst, category, "refused", f"status {status!r} isn't auto/review/skip", True)
@@ -725,6 +737,36 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     uj.write({"op": "undo", "batch": batch, "root": str(root), "dest_root": str(dest_root), "started": now_iso()})
     restored, skipped = 0, []
     prog = Progress("Undoing", total=len(moves), total_bytes=sum(m.get("size", 0) for m in moves) or None)
+    try:
+        restored = _put_back(conn, root, dest_root, fence, batch, moves, uj, skipped, prog)
+    except BaseException:  # Ctrl-C, Cancel, a full disk: what already went back is on record
+        conn.commit()
+        uj.close()
+        prog.done()
+        say(f"Stopped before everything was back. `dewey undo '{root}' --batch {batch}` puts back the rest.")
+        raise
+    prog.done()
+    removed = 0
+    for d in sorted(mkdirs, key=lambda p: -len(p.parts)):
+        if _remove_if_empty(d):  # left alone if something else lives there now
+            removed += 1
+    conn.execute("DELETE FROM labels WHERE batch=?", (batch,))
+    uj.write({"op": "end", "restored": restored, "skipped": len(skipped), "dirs_removed": removed,
+              "finished": now_iso()})
+    uj.close()
+    conn.commit()
+    say(f"Undo {batch}: restored {restored:,}, skipped {len(skipped)}, removed {removed} folders it had created")
+    for path, why in skipped[:10]:
+        say(f"  ! {path}: {why}")
+    return dict(batch=batch, restored=restored, skipped=len(skipped), dirs_removed=removed,
+                skipped_items=[{"path": path, "why": why} for path, why in skipped])
+
+
+def _put_back(conn, root: Path, dest_root: Path, fence: Fence, batch: str, moves: list, uj: Journal,
+              skipped: list, prog: Progress) -> int:
+    """Undo's moves, newest first. Each one is committed as it lands, as apply's are: an undo that is
+    stopped half way has put back exactly what History says it has."""
+    restored = 0
     for rec in reversed(moves):
         size = rec.get("size", 0)
         is_dir = rec.get("kind") == "folder"
@@ -805,23 +847,10 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
         if rec.get("file_id"):
             _repoint(conn, rec["file_id"], root, src)
         conn.execute("UPDATE moves SET undone_at=? WHERE batch=? AND row=?", (now_iso(), batch, rec["row"]))
+        conn.commit()
         restored += 1
         prog.update(1, size)
-    prog.done()
-    removed = 0
-    for d in sorted(mkdirs, key=lambda p: -len(p.parts)):
-        if _remove_if_empty(d):  # left alone if something else lives there now
-            removed += 1
-    conn.execute("DELETE FROM labels WHERE batch=?", (batch,))
-    uj.write({"op": "end", "restored": restored, "skipped": len(skipped), "dirs_removed": removed,
-              "finished": now_iso()})
-    uj.close()
-    conn.commit()
-    say(f"Undo {batch}: restored {restored:,}, skipped {len(skipped)}, removed {removed} folders it had created")
-    for path, why in skipped[:10]:
-        say(f"  ! {path}: {why}")
-    return dict(batch=batch, restored=restored, skipped=len(skipped), dirs_removed=removed,
-                skipped_items=[{"path": path, "why": why} for path, why in skipped])
+    return restored
 
 
 def export_labels(conn: sqlite3.Connection, cfg: dict, out: Path, include_rejected: bool = False) -> int:
@@ -861,8 +890,7 @@ def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, 
     for r in conn.execute("SELECT * FROM plan_rows WHERE plan_id=? ORDER BY row", (pid,)):
         e = edits.get(r["row"])
         res = resolve_row(r, e, cats, homes, fence)
-        typed = (res.status, (e.get("dst") or "").strip() if e else r["dst"],
-                 (e.get("category") or "").strip() if e else r["category"])
+        typed = (res.status, _typed(e, r, "dst"), _typed(e, r, "category"))
         rows.append({"row": r["row"], "src": r["src"], "action": r["action"], "size": r["size"] or 0,
                      "status": res.status, "dst": res.dst, "category": res.category,
                      "verdict": res.verdict, "why": res.why, "in_csv": e is not None,

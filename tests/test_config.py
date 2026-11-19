@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -197,6 +198,93 @@ class Settings(unittest.TestCase):
         self.assertIn("workers = 3", self.toml.read_text())
         self.write({"plan": {"max_depth": 2}}, "--expect-sha", self.read()["sha256"])
         self.assertIn("workers = 3", self.toml.read_text())
+
+    def test_a_rule_that_cant_be_filled_in_is_a_config_error_not_a_plan_that_stops(self):
+        rule = '[[rules]]\nname = "zips"\next = [".zip"]\ntarget = "%s"\n'
+        (self.root / "a.zip").write_bytes(b"zip")
+        self.toml.parent.mkdir()
+        for target, why in (("Zips/{year", "expected '}'"),             # stopped the plan: "internal" error
+                            ("Zips/{yaer}", "{yaer} isn't something"),  # quietly filed into Zips/
+                            ("Zips/{}", "{} isn't something"),
+                            ("Zips/{year.real}", "isn't something"),
+                            ("Zips/{year:d}", "Unknown format code"),
+                            ("Zips/{year:{camera}}", "isn't something"),
+                            ("Zips/}", "Single '}'")):
+            self.toml.write_text(rule % target)
+            s = self.read()
+            self.assertFalse(s["valid"], target)
+            self.assertIn("rule 'zips': target", s["error"])
+            self.assertIn(why, s["error"], target)
+            self.assertIn("{review} {year} {month} {camera}", s["error"])
+        code, events, _ = run_json("plan", self.R, "--backend", "none")  # was scan-first: "no completed scan"
+        self.assertEqual((code, events[-1]["code"]), (1, "config"), events[-1])
+        # from the app's form too, and a reason is checked like a target
+        rules = [{"name": "zips", "ext": [".zip"], "target": "Zips", "reason": "an archive {from the web}"}]
+        self.toml.unlink()
+        self.assertIn("rule 'zips': reason", self.refused({"rules": rules}))
+        self.assertFalse(self.toml.exists())
+        # what dewey does fill in, and real braces, are fine
+        rules[0].update(target="Zips/{year}/{month}", reason="an archive {{sic}} from {camera}{review}")
+        self.write({"rules": rules})
+        run_json("scan", self.R)
+        code, events, _ = run_json("plan", self.R, "--backend", "none")
+        self.assertEqual((code, events[-1]["event"]), (0, "result"), events[-1])
+        row = next(r for r in read_plan(self.root / ".dewey")[1] if r["src"] == "a.zip")
+        self.assertRegex(row["dst"], r"^Zips/20\d\d/[01]\d/a\.zip$")
+        self.assertEqual(row["reason"], "an archive {sic} from _Review")
+
+    def test_where_to_file_is_a_full_path_in_the_settings(self):
+        self.toml.parent.mkdir()
+        for dest in ("Sorted", "./Sorted", "../Sorted", "~nobody-by-this-name/Sorted"):
+            self.toml.write_text(f'[plan]\ndest = "{dest}"\n')
+            s = self.read()
+            self.assertIn("plan.dest must be a full path", s["error"], dest)
+            code, events, _ = run_json("status", self.R)
+            self.assertEqual((code, events[-1]["code"]), (1, "config"), dest)
+        self.toml.unlink()
+        self.assertIn("plan.dest must be a full path", self.refused({"plan": {"dest": "Sorted"}}))
+        for dest in ("", "~/Sorted", str(self.tmp / "Sorted")):
+            self.assertEqual(self.write({"plan": {"dest": dest}})["config"]["plan"]["dest"], dest)
+
+    def test_dest_typed_in_a_shell_is_relative_to_where_the_person_is(self):
+        (self.root / "a.zip").write_bytes(b"zip")
+        run_json("scan", self.R)
+        here = Path.cwd()
+        try:
+            os.chdir(self.tmp)
+            code, events, _ = run_json("plan", self.R, "--backend", "none", "--dest", "Sorted")
+        finally:
+            os.chdir(here)
+        self.assertEqual((code, events[-1]["event"]), (0, "result"), events[-1])
+        _, events, _ = run_json("rows", self.R)  # from anywhere else afterwards: the plan holds the full path
+        self.assertEqual(Path(events[-1]["data"]["dest_root"]), (self.tmp / "Sorted").resolve())
+
+    def test_a_file_a_person_wrote_outlives_any_number_of_saves(self):
+        mine = '# my notes: receipts go to Money, ask before changing\n[plan]\nmax_depth = 2\n'
+        self.toml.parent.mkdir()
+        self.toml.write_text(mine)
+        first = self.write({"plan": {"max_depth": 3}})
+        kept = Path(first["kept"])
+        self.assertRegex(kept.name, r"^dewey\.toml\.20\d\d-\d\d-\d\d\.bak$")
+        self.assertEqual((kept.read_text(), first["backup"]), (mine, first["kept"]))
+        app_made = self.toml.read_text()
+        for depth in (4, 5):  # 0.2.0: the second save replaced dewey.toml.bak, and `mine` was gone
+            again = self.write({"plan": {"max_depth": depth}})
+            self.assertEqual((again["kept"], Path(again["backup"]).name), (None, "dewey.toml.bak"))
+        self.assertEqual(kept.read_text(), mine)
+        self.assertIn("max_depth = 4", (self.toml.parent / "dewey.toml.bak").read_text())
+        self.assertNotEqual(app_made, self.toml.read_text())
+        # the app's own file with a note added by hand is a person's file too
+        noted = self.toml.read_text() + "# keep 5 until the tax folder is sorted\n"
+        self.toml.write_text(noted)
+        second = Path(self.write({"plan": {"max_depth": 1}})["kept"])
+        self.assertEqual((second.name, second.read_text()), (kept.name[:-4] + "-2.bak", noted))
+        # the same file put back and replaced again isn't kept twice
+        self.toml.write_text(mine)
+        self.assertEqual(self.write({}, "--reset")["kept"], str(kept))
+        self.assertEqual(sorted(p.name for p in self.toml.parent.glob("dewey.toml.*")),
+                         sorted(["dewey.toml.bak", kept.name, second.name]))
+        self.assertEqual(kept.read_text(), mine)
 
     def test_text_mode_lists_what_differs(self):
         self.write({"plan": {"max_depth": 3}})

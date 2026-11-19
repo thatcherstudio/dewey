@@ -37,7 +37,11 @@ if [ "$(cat build/python.from 2>/dev/null)" != "$PYHOME" ]; then
         lib/python$PY/lib-dynload/_tkinter* lib/python$PY/site-packages/pip*)
     echo "$PYHOME" > build/python.from
 fi
-uv pip install --quiet --python "$STAGE/bin/python3" --reinstall-package dewey '.[all]'
+# constraints.txt names the one version of each package that goes in, with the checksums of its
+# files: a build next month bundles what was tested, not what was released that morning. A pin
+# that no longer fits pyproject.toml, or a file that doesn't match its checksum, stops the build
+# here. `make pins` moves them forward.
+uv pip install --quiet --python "$STAGE/bin/python3" --reinstall-package dewey -c constraints.txt '.[all]'
 # .pyc files that never check their source: the app runs Python with -B, so nothing is written
 # into the signed bundle, and nothing is compiled again at each start.
 "$STAGE/bin/python3" -I -m compileall -q -j0 --invalidation-mode unchecked-hash "$STAGE/lib" >/dev/null

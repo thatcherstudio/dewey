@@ -1,0 +1,41 @@
+# What `make test` runs, on a Mac GitHub provides: the Python tests on the oldest Python dewey
+# supports and on the one the app bundles, then the app's own tests against that dewey.
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }}
+    runs-on: macos-latest  # the app needs Xcode 16 or newer
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      # Both actions are GitHub's own, pinned to the commit of the release named beside it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      # ~/.venvs/dewey is where the README installs dewey and where the tests look for it. The
+      # packages are the ones the app bundles (constraints.txt), each checked against its checksum.
+      - name: Install dewey
+        run: |
+          python -m venv ~/.venvs/dewey
+          ~/.venvs/dewey/bin/python -m pip install --require-hashes -r constraints.txt
+          ~/.venvs/dewey/bin/python -m pip install --no-deps -e .
+      - name: Python tests
+        run: make test-python
+      - name: App tests
+        if: matrix.python == '3.12'
+        run: make test-mac

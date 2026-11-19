@@ -292,7 +292,15 @@ I haven't verified that format.
 python -m unittest discover -s tests -v     # fake Laya + fake chat servers; full scan→plan→apply→undo
 make test                                   # the same, then the Mac app's Swift tests
 make test-app                               # both again, against the Python and dewey inside the app
+make pins                                   # move the app's bundled packages to today's versions
 ```
+
+Every push and pull request runs `make test` on GitHub (`.github/workflows/tests.yml`): the Python
+tests on 3.11 and 3.12, then the app's tests. `constraints.txt` holds the one version of each
+package the app bundles (pypdf, Pillow, pillow-heif, blake3), with the checksums of its files, so a
+build next month contains what was tested. `make pins` moves them forward; a test checks that
+they still cover what `pyproject.toml` asks for. The version number is in `pyproject.toml` and
+`src/dewey/__init__.py`; a test fails when the two differ.
 
 The Mac app is a SwiftPM package in `mac/`: `DeweyCore` (running dewey, decoding its events, the
 models behind each tab; all tested) and `Dewey` (SwiftUI). It drives dewey through `--json`: one JSON

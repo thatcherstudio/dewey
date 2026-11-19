@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build build/Dewey.app from mac/ (SwiftPM), with its own Python and dewey inside, so it needs
-# nothing else installed (Laya stays separate). Unsigned for distribution: signed ad hoc so macOS
-# will run it on the Mac that built it. Needs uv. Usage: scripts/build-app.sh [release|debug]
+# nothing else installed, and a copy of uv for its Install Laya button (Laya itself downloads into
+# ~/Library/Application Support/Dewey). Unsigned for distribution: signed ad hoc so macOS will run
+# it on the Mac that built it. Needs uv. Usage: scripts/build-app.sh [release|debug]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -10,6 +11,13 @@ APP="build/Dewey.app"
 PY="3.12"
 
 command -v uv >/dev/null || { echo "Building Dewey.app needs uv (brew install uv)." >&2; exit 1; }
+UV="$(realpath "$(command -v uv)")"
+# The app runs this uv on its own, so it must need nothing but macOS (Homebrew's and uv's own
+# installer's builds both do). A uv linked against other libraries would break once they change.
+if otool -L "$UV" | tail -n +2 | grep -qvE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+    echo "$UV links libraries outside macOS; install uv with brew or its installer." >&2
+    exit 1
+fi
 
 swift build --package-path mac -c "$CONFIG" --product Dewey
 BIN="$(swift build --package-path mac -c "$CONFIG" --show-bin-path)/Dewey"
@@ -50,6 +58,9 @@ cat > "$APP/Contents/Resources/bin/dewey" <<'SH'
 exec "$(dirname "$(realpath "$0")")/../python/bin/python3" -I -B -u -X utf8 -m dewey "$@"
 SH
 chmod 755 "$APP/Contents/Resources/bin/dewey"
+# For Setup's Install Laya button (LayaInstaller.swift). About 30 MB.
+cp "$UV" "$APP/Contents/Resources/bin/uv"
+chmod 755 "$APP/Contents/Resources/bin/uv"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -81,4 +92,4 @@ PLIST
 
 codesign --force --sign - "$APP" >/dev/null 2>&1
 codesign --verify "$APP"
-echo "Built $APP (dewey $VERSION, build $BUILD). Open it: open $APP"
+echo "Built $APP (dewey $VERSION, uv $("$APP/Contents/Resources/bin/uv" --version | cut -d' ' -f2), build $BUILD). Open it: open $APP"

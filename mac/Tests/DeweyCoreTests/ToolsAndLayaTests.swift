@@ -152,6 +152,21 @@ struct LayaControllerTests {
         #expect(await LayaController.probe(base) == .refused)
     }
 
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
+    func stopAndWaitReturnsOnceItsGone() async throws {
+        let exe = try tempDir().appending(path: "laya-serve")
+        try makeFile(exe, executable: true, text: fakeLaya)
+        let laya = LayaController(baseURL: URL(string: "http://127.0.0.1:\(Int.random(in: 60_001...65_000))")!)
+        await laya.start(executable: exe)
+        #expect(laya.executable == exe)
+        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+
+        await laya.stopAndWait()
+        #expect(!laya.isRunning && laya.executable == nil)
+        #expect(laya.status == .stopped)
+        #expect(await LayaController.probe(laya.baseURL) == .refused)
+    }
+
     private func waitFor(seconds: Double, _ condition: @MainActor () async -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {

@@ -86,7 +86,7 @@ struct LayaPanel: View {
                 } else {
                     Button("Start") { Task { await model.startLaya() } }
                         .disabled(model.layaServeURL == nil)
-                        .help(model.layaServeURL == nil ? "Install laya-serve first (see the setup screen)." : "")
+                        .help(model.layaServeURL == nil ? "Install Laya first: Setup, in the sidebar." : "")
                 }
             }
             if showLog || isFailed, !laya.log.isEmpty {

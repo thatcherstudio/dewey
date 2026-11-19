@@ -3,38 +3,45 @@ import Foundation
 public enum Tool: String, Sendable, CaseIterable {
     case dewey
     case layaServe = "laya-serve"
+    /// What the Install Laya button runs.
+    case uv
 
     /// The venv the README creates for this tool.
-    var venv: String {
+    var venv: String? {
         switch self {
         case .dewey: "dewey"
         case .layaServe: "laya"
+        case .uv: nil
         }
     }
 }
 
-/// Finds `dewey` and `laya-serve`: the app's own copy first, then the places the README installs
-/// them, then the person's login shell (apps opened from Finder get a bare PATH).
+/// Finds `dewey`, `laya-serve` and `uv`: the app's own copy first, then the one its Install Laya
+/// button set up, then the places the README installs them, then the person's login shell (apps
+/// opened from Finder get a bare PATH).
 public struct ToolLocator: Sendable {
     public var home: URL
     public var systemDirs: [URL]
     /// Tools inside the app (Dewey.app/Contents/Resources/bin, where build-app.sh puts dewey).
     public var bundledDir: URL?
+    /// Where the Install Laya button puts laya-serve (`LayaInstaller.Layout.bin`).
+    public var installedDir: URL?
     public var useLoginShell: Bool
 
     public init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
                 systemDirs: [URL] = [URL(fileURLWithPath: "/opt/homebrew/bin"), URL(fileURLWithPath: "/usr/local/bin")],
-                bundledDir: URL? = nil, useLoginShell: Bool = true) {
+                bundledDir: URL? = nil, installedDir: URL? = nil, useLoginShell: Bool = true) {
         self.home = home
         self.systemDirs = systemDirs
         self.bundledDir = bundledDir
+        self.installedDir = installedDir
         self.useLoginShell = useLoginShell
     }
 
     public func candidates(for tool: Tool) -> [URL] {
-        (bundledDir.map { [$0.appending(path: tool.rawValue)] } ?? [])
-            + [home.appending(path: ".venvs/\(tool.venv)/bin/\(tool.rawValue)"),
-               home.appending(path: ".local/bin/\(tool.rawValue)")]
+        [bundledDir, installedDir].compactMap { $0?.appending(path: tool.rawValue) }
+            + (tool.venv.map { [home.appending(path: ".venvs/\($0)/bin/\(tool.rawValue)")] } ?? [])
+            + [home.appending(path: ".local/bin/\(tool.rawValue)")]
             + systemDirs.map { $0.appending(path: tool.rawValue) }
     }
 
@@ -97,8 +104,8 @@ public enum SetupCommands {
     }
 
     public static let installLaya = """
-        uv venv ~/.venvs/laya --python 3.11
-        uv pip install --python ~/.venvs/laya/bin/python 'laya[serve]'
+        uv venv ~/.venvs/laya --python \(LayaInstaller.pythonVersion)
+        uv pip install --python ~/.venvs/laya/bin/python \(shellQuote(LayaInstaller.package))
         """
 
     public static let installUV = "brew install uv"

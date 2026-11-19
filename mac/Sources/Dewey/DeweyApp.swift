@@ -68,16 +68,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return .terminateCancel
             }
         }
-        let busy = model.busyFolders
-        guard !busy.isEmpty else { return .terminateNow }
+        let busy = model.busyFolders, installing = model.installer.isRunning
+        guard !busy.isEmpty || installing else { return .terminateNow }
         let alert = NSAlert()
-        alert.messageText = busy.count == 1
-            ? "Stop \(busy[0].activity) in \(busy[0].name) and quit?"
+        alert.messageText = busy.isEmpty ? "Stop installing Laya and quit?"
+            : busy.count == 1 ? "Stop \(busy[0].activity) in \(busy[0].name) and quit?"
             : "Stop dewey in \(busy.count) folders and quit?"
-        alert.informativeText = busy.contains { $0.moveRun?.isActive == true || $0.undoRun?.isActive == true }
-            ? "Dewey stops after the file in hand. Files already moved stay where they are now, and History can put "
-                + "them back."
-            : "Everything finished so far is saved, so the next Scan & Plan picks up from there."
+        alert.informativeText = [
+            busy.isEmpty ? nil
+                : busy.contains { $0.moveRun?.isActive == true || $0.undoRun?.isActive == true }
+                ? "Dewey stops after the file in hand. Files already moved stay where they are now, and History can "
+                    + "put them back."
+                : "Everything finished so far is saved, so the next Scan & Plan picks up from there.",
+            installing ? "Installing Laya stops too. What it downloaded is kept, so installing again picks up from there."
+                : nil,
+        ].compactMap { $0 }.joined(separator: " ")
         alert.addButton(withTitle: "Stop and Quit")
         alert.addButton(withTitle: "Keep Running")
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
@@ -86,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         model.cancelAllRuns()     // SIGINT, like Ctrl-C: dewey saves its work and exits by itself
         model.laya.stopForQuit()  // a laya-serve this app started never outlives it
+        model.installer.stopForQuit()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

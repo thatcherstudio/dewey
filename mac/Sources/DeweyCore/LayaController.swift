@@ -32,6 +32,8 @@ public final class LayaController {
     public private(set) var ownsServer = false
     /// The last 200 lines laya-serve printed.
     public private(set) var log: [String] = []
+    /// The laya-serve this app is running, while it runs.
+    public private(set) var executable: URL?
     public var baseURL: URL
     public var model: String
 
@@ -93,6 +95,7 @@ public final class LayaController {
             return
         }
         process = p
+        self.executable = executable
         ownsServer = true
         stopping = false
         log = []
@@ -114,6 +117,13 @@ public final class LayaController {
             try? await Task.sleep(for: .seconds(5))
             if self?.process?.processIdentifier == pid { kill(pid, SIGKILL) }
         }
+    }
+
+    /// `stop()`, then wait for it to exit: about 5 s at most, when SIGKILL ends it.
+    public func stopAndWait() async {
+        stop()
+        let deadline = Date().addingTimeInterval(7)
+        while process != nil && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
     }
 
     /// App quit: stop the server this app started and wait up to 3 s, so it never outlives the app.
@@ -144,6 +154,7 @@ public final class LayaController {
     private func exited(_ code: Int32) {
         pollTask?.cancel()
         process = nil
+        executable = nil
         ownsServer = false
         if stopping {
             status = .stopped

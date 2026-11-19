@@ -62,28 +62,30 @@ Dewey.app does the same steps in windows: add a folder, Scan & Plan with live pr
 plan in a table, preview and apply it, undo any batch, and edit the folder's settings. It carries
 its own Python 3.12 and dewey (with all the extras), so it doesn't need step 1 of the quick start,
 and it never writes dewey's files itself: every change goes through a dewey command. Laya is a
-separate install; the app starts and stops `laya-serve` for you. You build it yourself; it isn't
-signed or notarized.
+separate download that the app's **Install Laya** button does for you; the app starts and stops
+`laya-serve` too. You build it yourself; it isn't signed or notarized.
 
 You need macOS 14 or later, Xcode 16 or later (the Command Line Tools are enough:
 `xcode-select --install`), and [uv](https://docs.astral.sh/uv/) (`brew install uv`).
 
 1. Clone it: `git clone https://github.com/thatcherstudio/dewey.git && cd dewey`
-2. For the model's decisions, install Laya: the two `uv` lines of quick start step 2. The app starts
-   `laya-serve` itself. Without Laya, plans use your rules and duplicates only.
-3. Build it and open it:
+2. Build it and open it:
 
    ```bash
-   make run        # builds build/Dewey.app (about 75 MB), then opens it
+   make run        # builds build/Dewey.app (about 105 MB), then opens it
    ```
 
    The first build downloads Python and dewey's extras (about a minute); later builds take 3 to
    15 seconds.
+3. For the model's decisions, click **Install Laya** on the Setup screen. It downloads Python 3.11,
+   Laya, PyTorch and Laya's English model (about 1.7 GB) into
+   `~/Library/Application Support/Dewey/Laya`, which takes 5 to 15 minutes, then starts Laya.
+   Without Laya, plans use your rules and duplicates only. Already installed Laya with the quick
+   start's `uv` lines? Dewey finds it in `~/.venvs/laya` and skips this step.
 4. Optional: keep it with your other apps with `ditto build/Dewey.app /Applications/Dewey.app`.
 
 Dewey starts Laya as it opens; the light in the toolbar turns green when the model is ready (click
-it to stop or start Laya). Then **Add Folder…** (⌘O) and **Scan & Plan**. If it can't find
-`laya-serve`, **Setup** in the sidebar shows the command that installs it, with a Copy button.
+it to stop or start Laya). Then **Add Folder…** (⌘O) and **Scan & Plan**.
 
 | Tab | What it does | dewey underneath |
 |---|---|---|
@@ -105,10 +107,17 @@ Things worth knowing:
   works in Terminal too: `Dewey.app/Contents/Resources/bin/dewey`, which you can link into
   `~/.local/bin` to use as your `dewey`.
 - **Dewey > Settings… (⌘,)** holds app preferences: where `dewey` and `laya-serve` are (empty = the
-  dewey inside the app, and `laya-serve` found in `~/.venvs/laya/bin`, `~/.local/bin`, Homebrew,
-  then your shell's `PATH`), the model's URL, and whether Laya starts when Dewey opens.
-- **Quitting** stops the `laya-serve` the app started. A move in progress stops after the file in
-  hand, and History can undo what moved.
+  dewey inside the app, and the `laya-serve` Install Laya set up, else the one in `~/.venvs/laya/bin`,
+  `~/.local/bin`, Homebrew, then your shell's `PATH`), the model's URL, and whether Laya starts when
+  Dewey opens.
+- **Install Laya** uses a copy of uv inside the app, and keeps everything in one folder, which Time
+  Machine skips because it downloads again. Cancelled or failed, it keeps what it downloaded, so
+  the next try picks up from there. **Remove Laya…** on the Setup screen stops Laya and deletes
+  that folder (1.7 GB); after an install that didn't finish, **Delete Downloaded Files…** frees
+  what it got. In Terminal, run it as
+  `~/Library/Application\ Support/Dewey/Laya/bin/laya-serve`.
+- **Quitting** stops the `laya-serve` the app started, and an install in progress. A move in
+  progress stops after the file in hand, and History can undo what moved.
 - **To start over**, `defaults delete io.github.thatcherstudio.dewey` forgets the folder list and
   preferences. Each folder's `.dewey/` stays.
 

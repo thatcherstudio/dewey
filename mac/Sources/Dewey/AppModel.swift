@@ -8,6 +8,9 @@ enum Prefs {
     static let layaURL = "layaURL"
     static let startLayaOnLaunch = "startLayaOnLaunch"
     static let selection = "selection"
+    /// Where Install Laya puts Laya, instead of ~/Library/Application Support/Dewey/Laya. Not in the
+    /// Settings window: it is for trying the installer (`open Dewey.app --args -layaInstallRoot DIR`).
+    static let layaInstallRoot = "layaInstallRoot"
     static let defaultLayaURL = "http://127.0.0.1:8000"
 
     static func register() {
@@ -50,8 +53,14 @@ final class AppModel {
     var lastDeweyOK = false
     var deweyURL: URL?
     var layaServeURL: URL?
+    /// The uv Install Laya runs: the app's own, else one on this Mac (`swift run` has none inside).
+    var uvURL: URL?
+    /// What Install Laya's folder holds (0: nothing), for its Remove button.
+    var layaInstallBytes: Int64 = 0
+    var layaRemoveError: String?
     var appInfo: AppInfo?
     let laya: LayaController
+    let installer: LayaInstaller
 
     let folders = FolderStore()
     var selection: SidebarItem? {
@@ -75,18 +84,27 @@ final class AppModel {
         return false
     }
 
+    /// The laya-serve in use is the one Install Laya set up.
+    var layaInstalledByDewey: Bool { layaServeURL == installer.layout.layaServe }
+
     var deweyFix: String { SetupCommands.installDewey(repo: RepoPath.url) }
     var layaFix: String { SetupCommands.installLaya }
 
     init() {
         Prefs.register()
         laya = LayaController(baseURL: Self.layaBaseURL())
+        installer = LayaInstaller(layout: Self.layaLayout())
         selection = SidebarItem(storageKey: UserDefaults.standard.string(forKey: Prefs.selection))
             .flatMap { item in
                 if case .folder(let p) = item, !folders.paths.contains(p) { return nil }
                 return item
             }
             ?? folders.paths.first.map(SidebarItem.folder)
+    }
+
+    static func layaLayout() -> LayaInstaller.Layout {
+        guard let root = UserDefaults.standard.string(forKey: Prefs.layaInstallRoot), !root.isEmpty else { return .standard }
+        return LayaInstaller.Layout(root: URL(fileURLWithPath: (root as NSString).expandingTildeInPath))
     }
 
     static func layaBaseURL() -> URL {
@@ -108,9 +126,11 @@ final class AppModel {
         let d = UserDefaults.standard
         let deweyPref = d.string(forKey: Prefs.deweyPath) ?? ""
         let layaPref = d.string(forKey: Prefs.layaServePath) ?? ""
-        let locator = ToolLocator(bundledDir: Bundled.tools)
+        let locator = ToolLocator(bundledDir: Bundled.tools, installedDir: installer.layout.bin)
         async let foundDewey = locator.locate(.dewey, preferred: deweyPref)
         async let foundLaya = locator.locate(.layaServe, preferred: layaPref)
+        async let foundUV = locator.locate(.uv)
+        async let installBytes = installer.diskUsage()
 
         deweyURL = await foundDewey
         appInfo = nil
@@ -139,17 +159,49 @@ final class AppModel {
         }
 
         layaServeURL = await foundLaya
+        uvURL = await foundUV
+        layaInstallBytes = await installBytes
         if let url = layaServeURL {
-            layaServe = .ok(url.path)
+            layaServe = .ok(layaInstalledByDewey
+                            ? "Installed by Dewey, in \((installer.layout.root.path as NSString).abbreviatingWithTildeInPath)"
+                            : url.path)
         } else {
             layaServe = .problem(layaPref.isEmpty
-                                 ? "laya-serve isn't in ~/.venvs/laya, ~/.local/bin, Homebrew, or your shell's PATH. "
-                                   + "Without it, plans use your rules and duplicates only."
+                                 ? "Laya isn't installed. Without it, plans use your rules and duplicates only."
                                  : "The laya-serve path in Settings (\(layaPref)) isn't an executable file.")
         }
         await laya.refresh()
         lastDeweyOK = dewey.isOK
         checkedOnce = true
+    }
+
+    /// Install Laya, then start it.
+    func installLaya() async {
+        guard let uv = uvURL, !installer.isRunning else { return }
+        await installer.install(uv: uv)
+        guard installer.state == .finished else { return }
+        // A laya-serve path in Settings that doesn't work would hide the new install.
+        let d = UserDefaults.standard
+        if let pref = d.string(forKey: Prefs.layaServePath), !pref.trimmingCharacters(in: .whitespaces).isEmpty,
+           !ToolLocator.isExecutable(URL(fileURLWithPath: (pref as NSString).expandingTildeInPath)) {
+            d.removeObject(forKey: Prefs.layaServePath)
+        }
+        await checkAll()
+        await startLaya()
+    }
+
+    /// Delete what Install Laya put on this Mac, stopping the laya-serve it set up first. Laya stays
+    /// stopped afterwards, even when another laya-serve is on the Mac: the user asked for no Laya.
+    func removeLaya() async {
+        guard !installer.isRunning, !installer.isRemoving else { return }
+        layaRemoveError = nil
+        if laya.executable == installer.layout.layaServe { await laya.stopAndWait() }
+        do {
+            try await installer.remove()
+        } catch {
+            layaRemoveError = error.localizedDescription
+        }
+        await checkAll()
     }
 
     func startLaya() async {

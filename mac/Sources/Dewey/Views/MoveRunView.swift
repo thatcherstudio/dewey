@@ -255,6 +255,21 @@ struct UndoRequest: Identifiable {
     /// Where the batch filed things, when that is outside the folder: they come back from there.
     var from: String?
     var id: String { batch }
+
+    /// What the question says under its title. Built a sentence at a time: one long joined expression
+    /// is more than Xcode 26's compiler will type-check.
+    var detail: String {
+        var text = "They go back to where they were before this batch. A file changed since it moved stays where it "
+            + "is now, and folders Dewey made for them are removed if they're empty."
+        if let from {
+            let place = (from as NSString).abbreviatingWithTildeInPath
+            text += "\n\nThis batch filed them into \(place), outside this folder. They come back from there."
+        }
+        if newerBatch {
+            text += "\n\nA newer batch hasn't been undone. If it moved the same files, undo it first."
+        }
+        return text
+    }
 }
 
 extension View {
@@ -268,11 +283,7 @@ extension View {
             Button("Put Back") { folder.undo(batch: r.batch) }
             Button("Cancel", role: .cancel) {}
         } message: { r in
-            Text("They go back to where they were before this batch. A file changed since it moved stays where it "
-                 + "is now, and folders Dewey made for them are removed if they're empty."
-                 + (r.from.map { "\n\nThis batch filed them into \(($0 as NSString).abbreviatingWithTildeInPath), "
-                                 + "outside this folder. They come back from there." } ?? "")
-                 + (r.newerBatch ? "\n\nA newer batch hasn't been undone. If it moved the same files, undo it first." : ""))
+            Text(r.detail)
         }
     }
 }

@@ -61,11 +61,7 @@ struct ApplyView: View {
             Button("Move") { folder.startMove() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Each move is logged as it happens. If anything looks wrong afterwards, History puts them all back."
-                 + (apply.preview?.leavesFolderFor.map { "\n\nThey go to \($0), outside this folder." } ?? "")
-                 + (apply.previewIncludesReview && reviewCount > 0
-                    ? "\n\nIncludes \(ProgressText.count(reviewCount)) \(reviewCount == 1 ? "row" : "rows") still "
-                        + "marked Review." : ""))
+            Text(moveDetail)
         }
     }
 
@@ -257,5 +253,19 @@ struct ApplyView: View {
 
     private var moveQuestion: String {
         "Move \(what) (\(ProgressText.bytes(apply.preview?.bytes ?? 0)))?"
+    }
+
+    /// What the Move question says under its title. Built a sentence at a time: one long joined
+    /// expression is more than Xcode 26's compiler will type-check.
+    private var moveDetail: String {
+        var text = "Each move is logged as it happens. If anything looks wrong afterwards, History puts them all back."
+        if let dest = apply.preview?.leavesFolderFor {
+            text += "\n\nThey go to \(dest), outside this folder."
+        }
+        if apply.previewIncludesReview && reviewCount > 0 {
+            let rows = reviewCount == 1 ? "row" : "rows"
+            text += "\n\nIncludes \(ProgressText.count(reviewCount)) \(rows) still marked Review."
+        }
+        return text
     }
 }

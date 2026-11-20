@@ -1,6 +1,6 @@
 [project]
 name = "dewey"
-version = "0.2.0"
+version = "0.2.1"
 description = "Catalog a folder, recommend an organization with rules + a local decision model, move with an undoable journal."
 readme = "README.md"
 license = "MIT"

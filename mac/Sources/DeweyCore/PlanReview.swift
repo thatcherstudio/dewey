@@ -7,7 +7,7 @@ import Observation
 @MainActor @Observable
 public final class PlanReview {
     public enum Filter: String, CaseIterable, Sendable, Identifiable {
-        case all, auto, review, skip, duplicate, folder, changed, problems
+        case all, auto, review, skip, moved, duplicate, folder, changed, problems
         public var id: String { rawValue }
     }
 
@@ -35,8 +35,8 @@ public final class PlanReview {
         public let decidedBy: String
         public let reason: String
         public let alternatives: String
-        /// From dewey (move, stay, noop, refused) for saved values; a row with unsaved changes keeps
-        /// its last verdict until it is saved.
+        /// From dewey (move, stay, noop, refused, moved) for saved values; a row with unsaved changes
+        /// keeps its last verdict until it is saved.
         public let verdict: String
         public let why: String
         /// Differs from what the plan first said (saved in the CSV, or changed here).
@@ -49,6 +49,8 @@ public final class PlanReview {
         /// auto, review, skip, then anything else: the sort order of the Status column.
         public var statusRank: Int { PlanReview.statuses.firstIndex(of: status) ?? 3 }
         public var isFolder: Bool { action == "folder" }
+        /// A batch moved it and it hasn't been put back: done, and not to be changed here.
+        public var isMoved: Bool { verdict == "moved" }
     }
 
     public nonisolated static let statuses = ["auto", "review", "skip"]
@@ -62,6 +64,8 @@ public final class PlanReview {
     public private(set) var error: DeweyError?
     /// A one-line note after a save or reload, for the person.
     public var notice: String?
+    /// Called after a save that wrote the CSV: the folder's own counts (Overview) are read again.
+    @ObservationIgnored public var onSaved: (@MainActor () -> Void)?
     public private(set) var pending: [Int: Edit] = [:]
     public var filter: Filter = .all { didSet { rebuild() } }
     public var search = "" { didSet { rebuild() } }
@@ -85,10 +89,15 @@ public final class PlanReview {
     public func row(_ id: Int) -> PlanRow? { byRow[id] }
     public func displayRow(_ id: Int) -> Row? { all.first { $0.id == id } }
 
-    /// Where a row is on disk now (before apply).
+    /// Where a row is on disk now: where the plan found it, or where a batch has put it since.
     public func sourceURL(_ id: Int) -> URL? {
-        byRow[id].map { rootURL.appending(path: $0.src) }
+        guard let r = byRow[id] else { return nil }
+        if r.verdict == "moved", let plan { return URL(fileURLWithPath: plan.destRoot).appending(path: r.dst) }
+        return rootURL.appending(path: r.src)
     }
+
+    /// A row that can still be changed: one that hasn't moved.
+    private func canChange(_ id: Int) -> Bool { byRow[id].map { $0.verdict != "moved" } ?? false }
 
     // MARK: - loading and saving
 
@@ -116,7 +125,7 @@ public final class PlanReview {
         if rows.planId != plan?.planId { pending = [:] }
         plan = rows
         byRow = Dictionary(uniqueKeysWithValues: rows.rows.map { ($0.row, $0) })
-        pending = pending.filter { byRow[$0.key] != nil }
+        pending = pending.filter { canChange($0.key) }  // gone from the plan, or moved since
         for id in Array(pending.keys) { normalize(id) }
         error = nil
         rebuild()
@@ -158,6 +167,7 @@ public final class PlanReview {
             pending = [:]
             await load(planId: plan.planId)
             notice = "Saved \(n) \(n == 1 ? "change" : "changes") to \((res.csv as NSString).lastPathComponent)."
+            onSaved?()
             return true
         } catch DeweyError.failed(code: "stale", message: _) {
             await load(planId: plan.planId)
@@ -183,7 +193,7 @@ public final class PlanReview {
     /// Approve = auto (moves on apply), reject = skip (stays), review = moves only if review rows are included.
     public func setStatus(_ status: String, for ids: some Sequence<Int>) {
         precondition(Self.statuses.contains(status), "status must be auto, review or skip")
-        for id in ids where byRow[id] != nil {
+        for id in ids where canChange(id) {
             pending[id, default: Edit()].status = status
             normalize(id)
         }
@@ -191,7 +201,7 @@ public final class PlanReview {
     }
 
     public func setCategory(_ category: String, for ids: some Sequence<Int>) {
-        for id in ids where byRow[id] != nil {
+        for id in ids where canChange(id) {
             pending[id, default: Edit()].category = category
             normalize(id)
         }
@@ -201,7 +211,7 @@ public final class PlanReview {
     /// A typed destination, relative to the destination root. Ending in "/" means "into this folder".
     public func setDestination(_ dst: String, for id: Int) {
         let t = dst.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard byRow[id] != nil, !t.isEmpty else { return }
+        guard canChange(id), !t.isEmpty else { return }
         pending[id, default: Edit()].dst = t
         normalize(id)
         rebuild()
@@ -210,7 +220,7 @@ public final class PlanReview {
     /// Back to what the plan first said.
     public func revertToPlan(_ ids: some Sequence<Int>) {
         for id in ids {
-            guard let r = byRow[id] else { continue }
+            guard let r = byRow[id], canChange(id) else { continue }
             pending[id] = Edit(status: r.planned.status, category: r.planned.category,
                                dst: r.dst == r.planned.dst ? nil : r.planned.dst)
             normalize(id)
@@ -287,7 +297,8 @@ public final class PlanReview {
     public func matches(_ row: Row, _ filter: Filter) -> Bool {
         switch filter {
         case .all: true
-        case .auto, .review, .skip: row.status == filter.rawValue
+        case .auto, .review, .skip: row.status == filter.rawValue && !row.isMoved
+        case .moved: row.isMoved
         case .duplicate: row.action == "duplicate"
         case .folder: row.action == "folder"
         case .changed: row.changed

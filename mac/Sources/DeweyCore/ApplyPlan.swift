@@ -30,6 +30,9 @@ public final class ApplyPlan {
     /// Ready to move: a current preview with something in it.
     public var canMove: Bool { !loading && !isStale && (preview?.selected.isEmpty == false) }
 
+    /// The plan has been applied: its rows have moved and none is left. Nothing to offer but History.
+    public var hasMoved: Bool { !isStale && (preview?.hasMoved ?? false) }
+
     /// Dry run of the latest plan with the current options. A newer call wins over an older one
     /// still running (the toggle flipped twice).
     public func refresh() async {

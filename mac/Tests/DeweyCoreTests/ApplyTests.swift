@@ -61,6 +61,48 @@ import Testing
         #expect(nothing.destRoot == nil)
     }
 
+    @Test func aPlanWhoseRowsHaveMovedHasNothingLeftToMove() throws {
+        let applied = try decode(#"""
+        {"plan_id": 1, "dry_run": true, "bytes": 0, "refused": [], "selected": [], "already_moved": 120}
+        """#, as: ApplyPreview.self)
+        #expect(applied.alreadyMoved == 120)
+        #expect(applied.hasMoved)
+
+        let partly = try decode(#"""
+        {"plan_id": 1, "dry_run": true, "bytes": 4, "refused": [], "already_moved": 3,
+         "selected": [{"row": 4, "src": "late.dmg", "dst": "Installers/late.dmg", "status": "auto",
+                       "category": "rule:installer", "action": "move", "reason": "Installer", "size": 4}]}
+        """#, as: ApplyPreview.self)
+        #expect(!partly.hasMoved)  // one row was approved since: it can still move
+
+        let nothingMarked = try decode(#"""
+        {"plan_id": 1, "dry_run": true, "bytes": 0, "refused": [], "selected": [], "already_moved": 0}
+        """#, as: ApplyPreview.self)
+        #expect(!nothingMarked.hasMoved)  // "Nothing to move": no row is marked Move
+        let older = try decode(#"""
+        {"plan_id": 1, "dry_run": true, "bytes": 0, "refused": [], "selected": []}
+        """#, as: ApplyPreview.self)
+        #expect(older.alreadyMoved == nil)  // a dewey before 0.2.2 doesn't say
+        #expect(!older.hasMoved)
+    }
+
+    @Test func undoIsOfferedOnlyWhenSomethingMoved() throws {
+        // dewey 0.2.1 named a batch for a move in which every row was skipped
+        let nothing = try decode(#"""
+        {"batch": "20261118-041259-p1-002", "plan_id": 1, "dry_run": false, "moved": [], "failed": [], "refused": [],
+         "counts": {"moved": 0, "skipped": 1, "failed": 0, "bytes_moved": 0, "pruned_dirs": 0},
+         "skipped": [{"row": 1, "src": "a.dmg", "why": "source no longer exists"}]}
+        """#, as: ApplyResult.self)
+        #expect(nothing.batch != nil)
+        #expect(nothing.undoBatch == nil)
+
+        let moved = try decode(#"""
+        {"batch": "20261118-041259-p1", "plan_id": 1, "dry_run": false, "moved": [], "skipped": [], "failed": [],
+         "refused": [], "counts": {"moved": 1, "skipped": 0, "failed": 0, "bytes_moved": 4, "pruned_dirs": 0}}
+        """#, as: ApplyResult.self)
+        #expect(moved.undoBatch == "20261118-041259-p1")
+    }
+
     @Test func filesAndFoldersAreCountedApart() {
         #expect(ProgressText.items(files: 1, folders: 0) == "1 file")
         #expect(ProgressText.items(files: 4, folders: 2) == "4 files and 2 folders")

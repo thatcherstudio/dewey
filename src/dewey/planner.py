@@ -38,6 +38,11 @@ def norm_key(p: str) -> str:
     return unicodedata.normalize("NFC", p).casefold()
 
 
+def _inside(rel: str, folder: str) -> bool:
+    """`rel` is somewhere inside `folder` (both relative to the same place), as the disk compares names."""
+    return norm_key(rel).startswith(norm_key(folder) + "/")
+
+
 def plan_files(state_dir: Path, plan_id: int) -> tuple[Path, Path]:
     """A plan's CSV and report: fixed names in the state folder, so a folder that was renamed, copied
     or mounted somewhere else still finds its own. (`plans.csv_path` is where they were that day.)"""
@@ -138,6 +143,14 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
         if why:
             raise DeweyExit(f"plan.dest: {dest_root} is no place to file into: {why}", UNSAFE_DEST)
         say(f"note: this plan files things into {dest_root}, outside this folder.")
+    # A destination that is a folder inside this one (`dest = ".../Downloads/Sorted"`) is scanned with
+    # the rest, and what is in it is filed already, as it would be in a destination anywhere else.
+    # 0.2.1 planned those files again on every run: each one "moved" onto itself, so it was renamed
+    # "a (2).zip", and the destination was offered as a whole folder to move into itself.
+    dest_in = os.path.relpath(dest_root, root) if dest_root != root and root in dest_root.parents else ""
+    filed = lambda f: bool(dest_in) and _inside(f["rel_path"], dest_in)
+    review_at = f"{dest_in}/{review}" if dest_in else review  # the review folder, as a path in this folder
+    in_review = lambda f: _inside(f["rel_path"], review_at)
     scan = conn.execute("SELECT * FROM scans WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     if not scan:
         raise DeweyExit("no completed scan yet; run `dewey scan` first", NO_CATALOG)
@@ -172,7 +185,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
 
     whole = defaultdict(list)  # folder left whole -> catalog rows inside it
     for f in regular:
-        if too_deep(f) and not f["rel_path"].startswith(review + "/"):
+        if too_deep(f) and not in_review(f):
             whole["/".join(f["rel_path"].split("/")[:max_depth + 1])].append(f)
 
     # 1. duplicates ------------------------------------------------------------
@@ -184,11 +197,12 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
     for h, fs in groups.items():
         if len(fs) < 2:
             continue
-        # A copy inside a folder that stays whole can't move, so it is the one kept (unless it's
-        # already in the review area); only copies that may move go to review.
-        pinned = [f for f in fs if too_deep(f) and not f["rel_path"].startswith(review + "/")]
-        keeper = pick_keeper(pinned or fs, p["keep_duplicate"], review)
-        others = [f for f in fs if f["id"] != keeper["id"] and not too_deep(f)]
+        # A copy inside a folder that stays whole, or one that is filed already, can't move, so it
+        # is the one kept (unless it's already in the review area); only copies that may move go to review.
+        stays = lambda f: too_deep(f) or filed(f)
+        pinned = [f for f in fs if stays(f) and not in_review(f)]
+        keeper = pick_keeper(pinned or fs, p["keep_duplicate"], review_at)
+        others = [f for f in fs if f["id"] != keeper["id"] and not stays(f)]
         if not others:
             continue
         dup_groups.append((keeper, others))
@@ -203,8 +217,11 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
     for f in regular:
         if f["id"] in dup_ids:
             continue
-        if f["rel_path"].startswith(review + "/"):
+        if in_review(f):
             counts["in_review_area"] += 1
+            continue
+        if filed(f):
+            counts["already_filed"] += 1
             continue
         if too_deep(f):
             counts["below_max_depth"] += 1
@@ -254,7 +271,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
             f"Model: {choice} ({label}) at {conf:.2f}{note}", _alts(dec.probabilities, choice), st)
 
     # 4. folders left whole: label each, offer ONE review row that moves it as a unit ----------
-    folder_info = _plan_folders(cfg, root, review, max_depth, whole, units, add, rows)
+    folder_info = _plan_folders(cfg, root, review, max_depth, whole, units, add, rows, dest_in)
 
     # 5. destination names: no collisions on a case-insensitive filesystem ------
     taken: set[str] = set()
@@ -318,8 +335,11 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
 
 
 def _plan_folders(cfg: dict, root: Path, review: str, max_depth: int, whole: dict, units: list,
-                  add, rows: list) -> list[dict]:
-    """Label every folder left whole; add one review row per folder that has a home for its kind."""
+                  add, rows: list, dest_in: str = "") -> list[dict]:
+    """Label every folder left whole; add one review row per folder that has a home for its kind.
+
+    `dest_in`: the destination, when it is a folder inside this one. It is where dewey files things,
+    so neither it, nor a folder in it, nor a folder that holds it is offered as a folder to move."""
     if max_depth < 0:
         return []
     fcfg = cfg.get("folders") or {}
@@ -342,7 +362,9 @@ def _plan_folders(cfg: dict, root: Path, review: str, max_depth: int, whole: dic
         name = os.path.basename(prefix)
         size = unit["size"] if unit else sum(f["size"] or 0 for f in members)
         n_files = None if unit else len(members)
-        if norm_key(prefix.split("/")[0]) in filing:
+        is_dest = dest_in and (norm_key(prefix) == norm_key(dest_in) or _inside(prefix, dest_in)
+                               or _inside(dest_in, prefix))
+        if norm_key(prefix.split("/")[0]) in filing or is_dest:
             info.append(dict(path=prefix, kind="filing", why="dewey files things here", n=n_files, bytes=size, row=None))
             continue
         inner = [u for u in units if u["rel_path"].startswith(prefix + "/")]

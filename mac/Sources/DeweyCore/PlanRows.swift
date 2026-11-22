@@ -48,12 +48,13 @@ public struct PlanRow: Decodable, Sendable, Equatable, Identifiable {
     public var size: Int64
     /// auto | review | skip as the CSV says now (anything else is refused by apply).
     public var status: String
-    /// Where apply will put it, relative to the destination root.
+    /// Where apply will put it, relative to the destination root. For a row that has moved, where it is now.
     public var dst: String
     public var category: String
-    /// move | stay (a leave-it-here category) | noop (already there) | refused.
+    /// move | stay (a leave-it-here category) | noop (already there) | refused | moved (a batch
+    /// moved it and it hasn't been put back; dewey before 0.2.2 says "move" for those).
     public var verdict: String
-    /// Why a row is refused or stays.
+    /// Why a row is refused or stays, or which batch moved it.
     public var why: String
     /// false: the line was deleted from the CSV (which means skip).
     public var inCsv: Bool

@@ -149,6 +149,57 @@ struct PlanReviewTests {
     }
 }
 
+extension PlanReviewTests {
+    /// The plan above after a move: row 1 was moved by a batch (and renamed on the way, a file had
+    /// taken its name), into a destination that isn't the folder itself.
+    private func afterAMove() throws -> PlanReview {
+        var rows = try DeweyEvent.decoder().decode(PlanRows.self, from: Data(rowsJSON.utf8))
+        rows.destRoot = "/x/Sorted"
+        rows.rows[0].verdict = "moved"
+        rows.rows[0].dst = "Installers/setup (2).dmg"
+        rows.rows[0].why = "moved by batch 20261121-090000-p3; undo that batch to move it again"
+        let review = PlanReview(cli: DeweyCLI(executable: URL(fileURLWithPath: "/nonexistent")), root: "/x")
+        review.show(rows)
+        return review
+    }
+
+    @Test func aRowThatMovedIsCountedAsMovedNotAsWaitingToMove() throws {
+        let r = try afterAMove()
+        #expect(r.counts[.moved] == 1)
+        #expect(r.counts[.auto] == 1)  // row 5; row 1 is auto in the CSV too, and done
+        #expect(r.counts[.all] == 6)
+        r.filter = .moved
+        #expect(r.visible.map(\.id) == [1])
+        #expect(r.visible.first?.isMoved == true)
+        r.filter = .auto
+        #expect(r.visible.map(\.id) == [5])
+    }
+
+    @Test func aRowThatMovedCantBeChanged() throws {
+        let r = try afterAMove()
+        r.setStatus("skip", for: [1, 2])
+        r.setCategory("finance", for: [1])
+        r.setDestination("Elsewhere/", for: 1)
+        r.revertToPlan([1])
+        #expect(Array(r.pending.keys) == [2])
+    }
+
+    @Test func aRowThatMovedIsShownWhereItIsNow() throws {
+        let r = try afterAMove()
+        #expect(r.sourceURL(1)?.path == "/x/Sorted/Installers/setup (2).dmg")
+        #expect(r.sourceURL(2)?.path == "/x/minutes.docx")  // still where the plan found it
+    }
+
+    @Test func unsavedChangesToARowThatMovedMeanwhileAreDropped() throws {
+        let r = try loaded()
+        r.setStatus("skip", for: [1, 2])
+        var rows = try DeweyEvent.decoder().decode(PlanRows.self, from: Data(rowsJSON.utf8))
+        rows.rows[0].verdict = "moved"  // the same plan, read again after a move
+        r.show(rows)
+        #expect(Array(r.pending.keys) == [2])
+    }
+}
+
 /// PlanReview against the real dewey: the plan's verification step ("approve review rows in the
 /// app, then see them as auto in plan-N.csv"), and a save that loses to Numbers.
 @MainActor @Suite(.enabled(if: realDewey != nil, "needs ~/.venvs/dewey (see README)"), .timeLimit(.minutes(1)))
@@ -251,5 +302,98 @@ extension PlanReviewWithDeweyTests {
         await review.reload()
         #expect(review.notice?.contains("saved outside Dewey") == true)
         #expect(review.visible.first { $0.src == "Folder B" }?.status == "skip")
+    }
+}
+
+/// After a save and after a move, the app and dewey agree about what is done (0.2.2, group B).
+extension PlanReviewWithDeweyTests {
+    @Test func aSaveIsToldToTheFolderAndStatusCountsTheCSVAsItIsNow() async throws {
+        let (review, root) = try await plannedFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var saves = 0
+        review.onSaved = { saves += 1 }
+        let before = try await review.cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(before.latestPlan?.summary.folder.n == 3)
+        review.setStatus("auto", for: review.visible.filter { $0.status == "review" }.map(\.id))
+        #expect(await review.save())
+        #expect(saves == 1)
+        let after = try await review.cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(after.latestPlan?.summary.folder.n == 0)  // 0.2.1: still 3 to review, even after a relaunch
+        #expect(after.latestPlan?.summary.auto.n == 5)
+        #expect(review.plan?.summary == after.latestPlan?.summary)
+    }
+
+    @Test func aSaveThatLosesToNumbersIsNotToldAsASave() async throws {
+        let (review, root) = try await plannedFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var saves = 0
+        review.onSaved = { saves += 1 }
+        let id = try #require(review.visible.first { $0.src == "Folder A" }?.id)
+        review.setStatus("auto", for: [id])
+        let csv = review.plan!.csv
+        let text = try String(contentsOfFile: csv, encoding: .utf8)
+        try text.replacingOccurrences(of: ",review,folder,Folder B,", with: ",skip,folder,Folder B,")
+            .write(toFile: csv, atomically: true, encoding: .utf8)
+        #expect(await review.save() == false)
+        #expect(saves == 0)
+    }
+
+    @Test func anAppliedPlanHasNothingLeftToMoveAndItsRowsSayMoved() async throws {
+        let (review, root) = try await plannedFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cli = review.cli
+        let apply = ApplyPlan(cli: cli, root: root.path)
+        await apply.refresh()
+        #expect(apply.canMove)
+        #expect(!apply.hasMoved)
+        let moved = try await cli.run(try #require(apply.moveArguments()), as: ApplyResult.self)
+        #expect(moved.counts.moved == 2)
+        #expect(moved.undoBatch == moved.batch)
+
+        await apply.refresh()  // 0.2.1: the same two rows again, and Move enabled
+        #expect(apply.preview?.selected.isEmpty == true)
+        #expect(apply.preview?.alreadyMoved == 2)
+        #expect(apply.hasMoved)
+        #expect(!apply.canMove)
+        #expect(apply.moveArguments() == nil)
+
+        await review.load()
+        #expect(review.counts[.moved] == 2)
+        #expect(review.counts[.auto] == 0)
+        let dmg = try #require(review.visible.first { $0.src == "setup.dmg" })
+        #expect(dmg.isMoved)
+        let now = try #require(review.sourceURL(dmg.id))
+        #expect(FileManager.default.fileExists(atPath: now.path))  // Show in Finder has a file to show
+        #expect(now.path.hasSuffix("/Installers/setup.dmg"))
+
+        var status = try await cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(status.latestCanBeUndone)
+        #expect(status.latestPlan?.summary.moved.n == 2)
+        #expect(status.latestPlan?.summary.auto.n == 0)
+
+        let undone = try await cli.run(["undo", root.path], as: UndoResult.self)
+        #expect(undone.restored == 2)
+        status = try await cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(!status.latestCanBeUndone)
+        #expect(status.undoable == nil)
+        await apply.refresh()
+        #expect(apply.canMove)  // put back: they can move again
+        #expect(!apply.hasMoved)
+    }
+
+    @Test func aMoveThatMovesNothingNamesNoBatchToUndo() async throws {
+        let (review, root) = try await plannedFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        try fm.removeItem(at: root.appending(path: "setup.dmg"))
+        try fm.removeItem(at: root.appending(path: "Screenshot 2025-03-04 at 10.11.12.png"))
+        let result = try await review.cli.run(["apply", root.path], as: ApplyResult.self)
+        #expect(result.counts.moved == 0)
+        #expect(result.skipped.count == 2)
+        #expect(result.batch == nil)  // 0.2.1: a batch, "Undo This Batch…", "Put back 0 files?"
+        #expect(result.undoBatch == nil)
+        let status = try await review.cli.run(["status", root.path], as: FolderStatus.self)
+        #expect(status.undoable == nil)
+        #expect(status.batches.isEmpty)
     }
 }

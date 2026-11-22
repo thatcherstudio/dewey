@@ -159,11 +159,12 @@ final class FolderModel {
         run.start()
     }
 
-    /// After a move or undo: the catalog, the batches and the preview changed.
+    /// After a move or undo: the catalog, the batches, the preview and which rows have moved changed.
     private func filesMoved() {
         Task {
             await refresh()
             if apply != nil { await apply?.refresh() }
+            if let review { await review.load(planId: review.plan?.planId) }  // unsaved changes are kept
         }
         if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
     }
@@ -211,7 +212,11 @@ final class FolderModel {
 
     func makeReview() {
         guard review == nil, let cli = app?.cli else { return }
-        review = PlanReview(cli: cli, root: path)
+        let review = PlanReview(cli: cli, root: path)
+        // Overview's "Latest plan" counts come from `dewey status`: read it again after every save,
+        // whichever screen saved (Review, or Apply's "Save Changes").
+        review.onSaved = { [weak self] in Task { await self?.refresh() } }
+        self.review = review
     }
 
     func showInFinder() {

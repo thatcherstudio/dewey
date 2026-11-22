@@ -14,18 +14,22 @@ public struct Bucket: Decodable, Sendable, Equatable {
     }
 }
 
-/// A plan's counts by status (planner.summarize). `duplicate` rows are also counted under their status;
-/// `folder` rows are whole folders moved as one, so they are counted on their own.
+/// A plan's counts by status. From `dewey plan` they are as the plan was made (planner.summarize);
+/// from `status` (the latest plan) and `rows` they are as its CSV says now (mover.summary_now).
+/// `duplicate` rows are also counted under their status. `folder` rows are whole folders moved as
+/// one: they are counted on their own while they wait for review. `moved` rows have been moved by a
+/// batch and not put back; they are counted nowhere else (dewey before 0.2.2 doesn't say).
 public struct PlanSummary: Decodable, Sendable, Equatable {
     public var auto = Bucket()
     public var review = Bucket()
     public var skip = Bucket()
     public var duplicate = Bucket()
     public var folder = Bucket()
+    public var moved = Bucket()
 
     public init() {}
 
-    enum CodingKeys: String, CodingKey { case auto, review, skip, duplicate, folder }
+    enum CodingKeys: String, CodingKey { case auto, review, skip, duplicate, folder, moved }
 
     public init(from decoder: Decoder) throws {  // an interrupted plan stores "{}"
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -34,6 +38,7 @@ public struct PlanSummary: Decodable, Sendable, Equatable {
         skip = try c.decodeIfPresent(Bucket.self, forKey: .skip) ?? Bucket()
         duplicate = try c.decodeIfPresent(Bucket.self, forKey: .duplicate) ?? Bucket()
         folder = try c.decodeIfPresent(Bucket.self, forKey: .folder) ?? Bucket()
+        moved = try c.decodeIfPresent(Bucket.self, forKey: .moved) ?? Bucket()
     }
 }
 
@@ -163,7 +168,8 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
     public var plans: [Plan]
     /// Newest first.
     public var batches: [Batch]
-    /// The newest batch that still has files to put back.
+    /// The newest batch undo can still put something back from. Not always `batches.first`: that
+    /// one may be undone already, or hold only files that can't go back.
     public var undoable: String?
     public var labels: [LabelCount]
     /// Errors from the last scan (the first 20).
@@ -193,6 +199,9 @@ public struct FolderStatus: Decodable, Sendable, Equatable {
     }
 
     public var latestPlan: Plan? { plans.first }
+
+    /// The latest batch is the one a plain undo would put back.
+    public var latestCanBeUndone: Bool { batches.first.map { $0.batch == undoable } ?? false }
 
     /// Items of one kind in the catalog: file, bundle, project, symlink, cloud…
     public func count(_ kind: String) -> Int {

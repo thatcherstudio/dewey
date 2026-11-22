@@ -232,10 +232,14 @@ def status_data(conn, root: Path, state: Path) -> dict:
         "SELECT ext, COUNT(*) n, SUM(size) b FROM files WHERE kind='file' AND missing=0 "
         "GROUP BY ext ORDER BY b DESC LIMIT 8")]
     there = lambda p: str(p) if p.exists() else None  # where they are now, not where the plan was made
+    # The latest plan (the one apply takes, and the app shows) is counted as its CSV says now, with
+    # what has moved since. Older plans keep the counts they were made with: reading 20 CSVs on every
+    # status would be slow for nothing.
     plans = [{"id": p["id"], "created": p["created"], "decider": p["decider"],
               "csv": there(planner.plan_files(state, p["id"])[0]),
-              "report": there(planner.plan_files(state, p["id"])[1]), "summary": json.loads(p["summary"] or "{}")}
-             for p in conn.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 20")]
+              "report": there(planner.plan_files(state, p["id"])[1]),
+              "summary": mover.plan_summary(conn, root, state, p) if i == 0 else json.loads(p["summary"] or "{}")}
+             for i, p in enumerate(conn.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 20").fetchall())]
     batches = [{"batch": b["batch"], "moves": b["n"], "undone": b["u"] or 0, "plan_id": b["plan_id"],
                 "moved_at": b["moved_at"], "folders": b["f"] or 0,
                 "dest_outside": mover.batch_dest_outside(root, state, b["batch"])}
@@ -278,6 +282,7 @@ def cmd_status(args):
     for p in st["plans"][:5]:
         sm = p["summary"]
         parts = ", ".join(f"{sm[k]['n']:,} {k}" for k in ("auto", "review", "skip", "duplicate", "folder") if k in sm)
+        parts += f", {sm['moved']['n']:,} moved" if sm.get("moved", {}).get("n") else ""
         say(f"Plan {p['id']} ({p['created']}, {p['decider']}): {parts}")
     for b in st["batches"][:5]:
         undone = f", {b['undone']} undone" if b["undone"] else ""

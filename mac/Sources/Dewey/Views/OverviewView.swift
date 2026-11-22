@@ -178,6 +178,9 @@ struct StatusCards: View {
                     Text("\(ProgressText.count(s.folder.n)) whole \(s.folder.n == 1 ? "folder" : "folders") to review")
                         .foregroundStyle(.secondary)
                 }
+                if s.moved.n > 0 {
+                    Text("\(ProgressText.count(s.moved.n)) moved already").foregroundStyle(.secondary)
+                }
                 HStack(spacing: 4) {
                     if let date = DeweyDate.parse(plan.created) {
                         Text("Made \(date.formatted(.relative(presentation: .named)))")
@@ -221,7 +224,7 @@ struct StatusCards: View {
                 }
                 HStack {
                     Button("History", action: history)
-                    if status.undoable != nil {
+                    if status.latestCanBeUndone {
                         Text("Can be undone").font(.caption).foregroundStyle(.secondary)
                     }
                 }

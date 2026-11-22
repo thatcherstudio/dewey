@@ -137,6 +137,7 @@ struct ApplyView: View {
             .frame(minWidth: 110, alignment: .leading)
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
             if !p.refused.isEmpty { Stat(n: p.refused.count, label: "refused", tint: .red) }
+            if let moved = p.alreadyMoved, moved > 0 { Stat(n: moved, label: "moved already", tint: .blue) }
             Spacer()
         }
         .opacity(apply.isStale ? 0.4 : 1)
@@ -190,6 +191,20 @@ struct ApplyView: View {
                 Button("Show in Finder") { reveal(ids, in: p) }
             }
             .opacity(apply.isStale ? 0.4 : 1)
+        } else if let p = apply.preview, apply.hasMoved {
+            VStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 40)).foregroundStyle(.green)
+                Text("This plan has been applied").font(.title2.bold())
+                Text(appliedDetail(p.alreadyMoved ?? 0))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+                HStack {
+                    Button("History") { folder.tab = .history }
+                    Button("Review Plan") { folder.openReview() }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let p = apply.preview {
             VStack(spacing: 10) {
                 Image(systemName: "checkmark.circle").font(.system(size: 40)).foregroundStyle(.secondary)
@@ -210,6 +225,14 @@ struct ApplyView: View {
         }
     }
 
+    /// What the applied plan's screen says under its title. Built a sentence at a time, like `moveDetail`.
+    private func appliedDetail(_ n: Int) -> String {
+        var text = "\(MoveRunView.rows(n)) moved, and none is left to move."
+        text += n == 1 ? " History puts it back." : " History puts them back."
+        text += " Rows marked Review or Skip stay until you approve them."
+        return text
+    }
+
     private func reveal(_ ids: Set<Int>, in p: ApplyPreview) {
         let root = URL(fileURLWithPath: folder.path)
         let urls = p.selected.filter { ids.contains($0.row) }.map { root.appending(path: $0.src) }
@@ -223,6 +246,8 @@ struct ApplyView: View {
             if apply.loading {
                 ProgressView().controlSize(.small)
                 Text("Checking the plan…").foregroundStyle(.secondary)
+            } else if (apply.preview?.alreadyMoved ?? 0) > 0 {
+                Text("Preview only. What this plan moved before is in History.").foregroundStyle(.secondary)
             } else {
                 Text("Preview only: nothing has moved yet.").foregroundStyle(.secondary)
             }
@@ -230,10 +255,12 @@ struct ApplyView: View {
             Button("Refresh") { Task { await apply.refresh() } }
                 .help("Read the plan file again (after editing it in Numbers)")
                 .disabled(apply.loading)
-            Button(moveTitle) { confirmMove = true }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(!apply.canMove || folder.hasUnsavedChanges || folder.isRunning)
+            if !apply.hasMoved {  // an applied plan has nothing to move: no Move button to press twice
+                Button(moveTitle) { confirmMove = true }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!apply.canMove || folder.hasUnsavedChanges || folder.isRunning)
+            }
         }
         .controlSize(.large)
     }

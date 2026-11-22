@@ -325,12 +325,24 @@ class Fence:
         return None
 
     def made_here(self, d: Path) -> bool:
-        """`d` is somewhere apply could have made a folder: undo may remove it if it is empty."""
+        """`d` is somewhere apply could have made a folder: undo may remove it if it is empty.
+
+        That is anywhere inside the destination, and the destination itself with the folders above
+        it, when they weren't there (`--dest ~/Sorted/2026` makes both). Above the destination a
+        journal is believed no further than this: never the folder being organized or one that
+        holds it, never a system folder or a hidden one."""
         try:
             inside = d.relative_to(self.dest_root).as_posix()
         except ValueError:
+            inside = None
+        if inside not in (None, "."):
+            return self.problem("x", f"{inside}/x", fresh=True) is None
+        if d != self.dest_root and d not in self.dest_root.parents:
             return False
-        return inside != "." and self.problem("x", f"{inside}/x", fresh=True) is None
+        real = os.path.realpath(d)
+        if not self.outside:
+            return real != self._root and _under(real, self._root)
+        return not _under(self._root, real) and unsafe_dest(Path(real)) is None
 
 
 def _is_what_moved(rec: dict, st: os.stat_result, path: Path) -> bool:
@@ -432,10 +444,15 @@ def _typed(e: dict | None, r, key: str) -> str:
     return planned if cell == planned.strip() else cell
 
 
+def _status(e: dict | None) -> str:
+    """A row's status as its CSV line says now. A deleted line (None) means skip."""
+    return (e.get("status") or "").strip().lower() if e else "skip"
+
+
 def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Resolution:
     """One plan row (`plan_rows`) plus its CSV line (None = deleted). Shared by apply and `dewey rows`."""
     dest_root, root = fence.dest_root, fence.root
-    status = (e.get("status") or "").strip().lower() if e else "skip"
+    status = _status(e)
     dst = _typed(e, r, "dst")
     category = _typed(e, r, "category")
     if _typed(e, r, "src") != r["src"]:
@@ -461,8 +478,8 @@ def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Res
     if not _safe_rel(dst):
         return Resolution(status, dst, category, "refused",
                           f"dst {dst!r} must be a relative path inside the destination root")
-    if norm_key(dst) == norm_key(r["src"]) and dest_root == root:
-        return Resolution(status, dst, category, "noop")
+    if norm_key(str(dest_root / dst)) == norm_key(str(root / r["src"])):  # the place it is in, also when the
+        return Resolution(status, dst, category, "noop")                  # destination is a folder inside this one
     why = fence.problem(r["src"], dst)
     if why:
         return Resolution(status, dst, category, "refused", why)
@@ -514,6 +531,58 @@ def _selection_sha(pid: int, dest_root: Path, selected: list) -> str:
     return _sha256(json.dumps([pid, str(dest_root), moves]).encode())
 
 
+def moved_rows(conn, root: Path, state_dir: Path, pid: int) -> dict[int, tuple[str, Path]]:
+    """The rows of a plan that a batch moved and no undo has put back: row -> (the batch, where the
+    row is now). They are done. Apply doesn't select them again (it would only find each source
+    gone), and `dewey rows` and the dry run say so, so the app doesn't offer to move them twice."""
+    done, was = {}, {}
+    for m in conn.execute("SELECT row, batch, dst FROM moves WHERE plan_id=? AND undone_at IS NULL ORDER BY id",
+                          (pid,)):
+        if m["batch"] not in was:  # the folder may have been renamed since that batch
+            was[m["batch"]] = _batch_places(_batch_head(state_dir, m["batch"]), root)[0]
+        done[m["row"]] = (m["batch"], _moved_with(Path(m["dst"]), was[m["batch"]], root))
+    return done
+
+
+def summary_now(rows, edits: dict[int, dict], done) -> dict:
+    """A plan's counts as its CSV says now: the statuses a person changed, lines they deleted (skip),
+    and rows that have moved since. `planner.summarize` has them as they were when the plan was made,
+    and the two agree on a plan nobody has touched.
+
+    A whole folder is counted on its own (`folder`) while it waits for a yes or no. Once someone
+    decides, it is counted under what they chose, like any other row."""
+    s = {k: {"n": 0, "bytes": 0} for k in ("auto", "review", "skip", "duplicate", "folder", "moved")}
+
+    def count(key: str, size: int) -> None:
+        s[key]["n"] += 1
+        s[key]["bytes"] += size
+
+    for r in rows:
+        size = r["size"] or 0
+        if r["row"] in done:
+            count("moved", size)
+            continue
+        status = _status(edits.get(r["row"]))
+        if r["action"] == "folder" and status == "review":
+            count("folder", size)
+            continue
+        if status in ("auto", "review", "skip"):  # anything else is a row apply refuses
+            count(status, size)
+        if r["action"] == "duplicate":
+            count("duplicate", size)
+    return s
+
+
+def plan_summary(conn, root: Path, state_dir: Path, plan) -> dict:
+    """`summary_now` for `dewey status`. A plan whose CSV can't be read keeps the counts it was made with."""
+    try:
+        _, _, csv_rows = read_plan_csv(plan_files(state_dir, plan["id"])[0])
+    except (DeweyExit, csv.Error):
+        return json.loads(plan["summary"] or "{}")
+    rows = conn.execute("SELECT row, size, action FROM plan_rows WHERE plan_id=?", (plan["id"],))
+    return summary_now(rows, edits_by_row(csv_rows), moved_rows(conn, root, state_dir, plan["id"]))
+
+
 def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan_id: int | None = None,
           csv_path: str | None = None, include_review: bool = False, dry_run: bool = False,
           prune_empty: bool = False, expect_sha: str | None = None) -> dict:
@@ -537,8 +606,12 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     _, _, csv_rows = read_plan_csv(csv_path)
     edits = edits_by_row(csv_rows)
 
+    done = moved_rows(conn, root, state_dir, pid)
+    already = sum(rowno in done for rowno in db_rows)
     selected, refused, rejected = [], [], []
     for rowno in sorted(db_rows):
+        if rowno in done:  # an earlier batch moved it, and it hasn't been put back
+            continue
         r = db_rows[rowno]
         e = edits.get(rowno)
         res = resolve_row(r, e, cats, homes, fence)
@@ -571,7 +644,8 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     n_dirs = sum(r["action"] == "folder" for r, *_ in selected)
     what = f"{len(selected) - n_dirs:,} files" + (f" + {n_dirs:,} whole folder{'s' if n_dirs != 1 else ''}" if n_dirs else "")
     say(f"Plan {pid}: {what} to move ({human_bytes(total)})"
-        f"{' including review rows' if include_review else ''}; {len(refused)} refused")
+        f"{' including review rows' if include_review else ''}; {len(refused)} refused"
+        f"{f'; {already:,} already moved' if already else ''}")
     for r, why in refused[:20]:
         say(f"  refused row {r['row']} {r['src']}: {why}")
 
@@ -583,14 +657,16 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
         say("Dry run: nothing moved.")
         if selected:
             say(f"  To move these only if nothing has changed since: add --expect-sha {sha[:12]}")
-        return dict(plan_id=pid, dry_run=True, bytes=total, refused=refused_items,
+        return dict(plan_id=pid, dry_run=True, bytes=total, refused=refused_items, already_moved=already,
                     dest_root=str(dest_root), dest_outside=fence.outside, selection_sha256=sha,
                     selected=[{"row": r["row"], "src": r["src"], "dst": dst, "status": status, "category": category,
                                "action": r["action"], "reason": r["reason"], "size": r["size"] or 0}
                               for r, status, dst, category in selected])
     if not selected:
-        say("Nothing to do.")
+        say("Nothing to do." + (f" {already:,} row{'s' if already != 1 else ''} of this plan already moved."
+                                if already else ""))
         return dict(plan_id=pid, dry_run=False, batch=None, moved=[], skipped=[], failed=[], refused=refused_items,
+                    already_moved=already,
                     counts={"moved": 0, "skipped": 0, "failed": 0, "bytes_moved": 0, "pruned_dirs": 0})
 
     batch = base = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-p{pid}"
@@ -606,7 +682,23 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     moved, skipped, failed = [], [], []
     reserved: set[str] = set()
     created_dirs: set[str] = set()
+    made: list[Path] = []  # the folders this batch made, in the order it made them
+    tried = 0              # moves the journal has: begun, whether or not they worked
+    in_hand = False        # a move is journaled and not yet known to have worked or failed
     review = str(cfg.get("plan", {}).get("review_dir") or "").strip("/")
+
+    def nothing_moved() -> None:
+        """This batch moved nothing: it isn't one. The folders made for it go again, and a journal
+        with no move in it goes too. One that names moves that failed stays, as the record of them,
+        closed by an `end` that says none moved: undo passes over it (`undoable`)."""
+        for d in sorted(made, key=lambda p: -len(p.parts)):
+            _remove_if_empty(d)
+        if tried:
+            j.write({"op": "end", "finished": now_iso(), "moved": 0, "skipped": len(skipped),
+                     "failed": len(failed), "pruned_dirs": 0})
+        j.close()
+        if not tried:
+            j.path.unlink(missing_ok=True)
 
     def set_aside(r, dst: str) -> bool:
         """A duplicate still going where the plan sent it, or into the review folder as it is named
@@ -691,25 +783,32 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
                                            "or set this row to skip")
                 # record directories we create, so undo can remove them again. Inside the try: a plain
                 # file sitting where a folder must go fails this one row instead of the whole batch.
+                # The destination itself and the folders above it too, when they aren't there yet
+                # (`--dest ~/Sorted/2026`): mkdir makes them all, so undo has to know of them all.
                 missing_dirs, d = [], dst_abs.parent
-                while d != dest_root and not d.exists() and str(d) not in created_dirs:
+                while not d.exists() and str(d) not in created_dirs:
                     missing_dirs.append(d)
                     d = d.parent
                 for d in reversed(missing_dirs):
                     j.write({"op": "mkdir", "path": str(d)})
+                    made.append(d)
                 dst_abs.parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.update(str(d) for d in missing_dirs)
+                in_hand = True
                 j.write(rec)  # intent first: the journal is never behind the disk
+                tried += 1
                 if half_moved:
                     os.unlink(src_abs)
                     how = "rename"
                 else:
                     how = move_dir(src_abs, dst_abs) if is_dir else move_file(src_abs, dst_abs, r["hash"], algo)
             except Exception as ex:  # noqa: BLE001
+                in_hand = False  # a move that raised left its file where it was (move_file, _noclobber_rename)
                 j.write({"op": "failed", "row": r["row"], "error": f"{type(ex).__name__}: {ex}"})
                 failed.append({"row": r["row"], "src": r["src"], "error": f"{type(ex).__name__}: {ex}"})
                 prog.update(1, size)
                 continue
+            in_hand = False
             rec["method"] = how
             moved.append(rec)
             conn.execute("INSERT INTO moves (batch, plan_id, row, file_id, hash, src, dst, reason, decided_by, "
@@ -731,8 +830,12 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
             prog.update(1, size)
     except BaseException as ex:
         conn.commit()
-        j.close()
         prog.done()
+        if not moved and not in_hand:  # stopped before the first file: there is no batch to name or undo
+            nothing_moved()
+            say("Stopped before anything moved.")
+            raise
+        j.close()
         try:
             ex.batch = batch  # the app's "interrupted" event names the batch to undo
         except (AttributeError, TypeError):
@@ -743,6 +846,18 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     finally:
         hold.end()
     prog.done()
+    if not moved:  # every row was skipped or failed. 0.2.1 kept this as a batch, and undo took it for the latest
+        nothing_moved()
+        conn.commit()
+        say(f"Moved 0 files; skipped {len(skipped)}, failed {len(failed)}")
+        for s in (skipped + failed)[:10]:
+            say(f"  ! row {s['row']} {s['src']}: {s.get('why') or s.get('error')}")
+        if tried:
+            say(f"  log:  {j.path}")
+        return dict(plan_id=pid, dry_run=False, batch=None, root=str(root), dest_root=str(dest_root), moved=[],
+                    skipped=skipped, failed=failed, pruned_dirs=[], refused=refused_items, already_moved=already,
+                    counts={"moved": 0, "skipped": len(skipped), "failed": len(failed), "bytes_moved": 0,
+                            "pruned_dirs": 0})
     for r, label in rejected:  # label: the category the person chose instead (e.g. "other"), or None
         if (r["decided_by"] or "").startswith(DECIDER_PREFIXES):
             conn.execute("INSERT INTO labels (file_id, hash, state, label, proposed, source, batch, created) "
@@ -773,7 +888,7 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     for s in (skipped + failed)[:10]:
         say(f"  ! row {s['row']} {s['src']}: {s.get('why') or s.get('error')}")
     say(f"  log:  {mdir / (batch + '.jsonl')}\n  json: {out_json}\n  undo: dewey undo ROOT --batch {batch}")
-    return {**summary, "dry_run": False, "refused": refused_items}
+    return {**summary, "dry_run": False, "refused": refused_items, "already_moved": already}
 
 
 def _repoint(conn, file_id: int, root: Path, new_abs: Path) -> None:
@@ -829,23 +944,101 @@ def _prune(root: Path, dirs: list[Path], j: Journal) -> list[str]:
     return pruned
 
 
-def latest_batch(conn, state_dir: Path) -> str | None:
-    """Newest batch that still has something to undo.
+def _journal(path: Path) -> list[dict]:
+    """Every whole record of a journal. A torn last line, from a crash, is passed over."""
+    recs = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line) if line.strip() else None
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    recs.append(rec)
+    except OSError:
+        pass
+    return recs
 
-    The journals on disk decide which batches exist: each move is journaled before it happens,
-    so a batch killed before its first database commit still counts. The database only says
-    which rows were already put back. Batch ids start with a timestamp, so names sort by time.
-    """
+
+def _batch_head(state_dir: Path, batch: str) -> dict:
+    """A batch's first journal line: the folder that day, where it filed things, when it began.
+    Empty when it can't be read."""
+    try:
+        with open(state_dir / "moves" / f"{batch}.jsonl", encoding="utf-8") as fh:
+            head = json.loads(fh.readline())
+    except (OSError, ValueError):
+        return {}
+    return head if isinstance(head, dict) and head.get("op") == "batch" else {}
+
+
+def _began(state_dir: Path, batch: str) -> float:
+    """When a batch began, to put batches in order. A batch id is the time on the wall clock, which
+    runs backwards across a time zone and at the autumn clock change; the journal's first line has
+    the offset as well. Without one, the id is all there is."""
+    try:
+        return datetime.fromisoformat(_batch_head(state_dir, batch)["started"]).timestamp()
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        pass
+    try:
+        return datetime.strptime(batch[:15], "%Y%m%d-%H%M%S").timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
+def _never_moved(state_dir: Path, batch: str) -> bool:
+    """A batch the catalog has no moves of, with nothing for undo either: its journal names no move,
+    or it ran to its end and says none of them worked. (0.2.1 kept such batches. A batch that was
+    killed has a move and no end, and its file in hand may be at either place: that one counts.)"""
+    recs = _journal(state_dir / "moves" / f"{batch}.jsonl")
+    if not any(r.get("op") == "move" for r in recs):
+        return True
+    end = next((r for r in reversed(recs) if r.get("op") == "end"), None)
+    return end is not None and not end.get("moved")
+
+
+def _undo_put_nothing_back(state_dir: Path, batch: str) -> bool:
+    """The last undo of this batch ran to its end and restored nothing: what is still out can't go
+    back as things are (edited since, locked, something else in its place)."""
+    recs = _journal(state_dir / "moves" / f"{batch}.undo.jsonl")
+    last = next((r for r in reversed(recs) if r.get("op") in ("undo", "end")), None)
+    return last is not None and last["op"] == "end" and not last.get("restored")
+
+
+def undoable(conn, state_dir: Path) -> tuple[str | None, list[str]]:
+    """(the newest batch undo can still put something back from, newer batches it passed over).
+
+    The journals on disk decide which batches exist: each move is journaled before it happens, so a
+    batch killed before its first database commit still counts. The database says which rows were
+    already put back. Batches are taken in the order they began (`_began`), not by name.
+
+    Passed over, and named: a batch with files still out whose last undo put none of them back.
+    Trying it again on every `dewey undo` kept the batches before it out of reach. It can still be
+    asked for with --batch. Passed over without a word: a batch that moved nothing."""
     mdir = state_dir / "moves"
     if not mdir.is_dir():
-        return None
+        return None, []
     batches = [p.name[:-len(".jsonl")] for p in mdir.glob("*.jsonl") if not p.name.endswith(".undo.jsonl")]
-    for batch in sorted(batches, reverse=True):  # ids, not file names: "-p1" < "-p1-002", but "-p1." > "-p1-"
+    stuck = []
+    for batch in sorted(batches, key=lambda b: (_began(state_dir, b), b), reverse=True):
         n, still_out = conn.execute("SELECT COUNT(*), COALESCE(SUM(undone_at IS NULL), 0) FROM moves "
                                     "WHERE batch=?", (batch,)).fetchone()
-        if still_out or (n == 0 and not (mdir / f"{batch}.undo.jsonl").exists()):
-            return batch
-    return None
+        if n == 0:
+            if (mdir / f"{batch}.undo.jsonl").exists() or _never_moved(state_dir, batch):
+                continue
+            return batch, stuck
+        if not still_out:
+            continue
+        if _undo_put_nothing_back(state_dir, batch):
+            stuck.append(batch)
+            continue
+        return batch, stuck
+    return None, stuck
+
+
+def latest_batch(conn, state_dir: Path) -> str | None:
+    """Newest batch that still has something undo can put back."""
+    return undoable(conn, state_dir)[0]
 
 
 def _batch_places(head: dict, root: Path) -> tuple[Path, Path]:
@@ -857,33 +1050,27 @@ def _batch_places(head: dict, root: Path) -> tuple[Path, Path]:
 
 def batch_dest_outside(root: Path, state_dir: Path, batch: str) -> str | None:
     """Where a batch filed things, when that is outside the folder (the app says so before an undo)."""
-    try:
-        with open(state_dir / "moves" / f"{batch}.jsonl", encoding="utf-8") as fh:
-            head = json.loads(fh.readline())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(head, dict) or head.get("op") != "batch":
+    head = _batch_head(state_dir, batch)
+    if not head:
         return None
     dest_root = _batch_places(head, root)[1]
     return str(dest_root) if Fence(root, dest_root).outside else None
 
 
 def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | None = None) -> dict:
-    batch = batch or latest_batch(conn, state_dir)
     if not batch:
-        raise DeweyExit("nothing to undo", NOTHING_TO_UNDO)
+        batch, stuck = undoable(conn, state_dir)
+        again = "; ".join(f"`dewey undo '{root}' --batch {b}` tries batch {b} again" for b in stuck)
+        if not batch:
+            raise DeweyExit("nothing to undo" + (f": the last undo couldn't put back what is still out ({again})"
+                                                 if stuck else ""), NOTHING_TO_UNDO)
+        if stuck:
+            say(f"note: a newer batch still has files out that its last undo couldn't put back ({again}). "
+                f"Undoing the batch before it, {batch}.")
     jpath = state_dir / "moves" / f"{batch}.jsonl"
     if not jpath.exists():
         raise DeweyExit(f"journal not found: {jpath}")
-    recs = []
-    with open(jpath, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                try:
-                    recs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass  # a torn final line from a crash: ignore it
+    recs = _journal(jpath)
     moves = [r for r in recs if r.get("op") == "move"]
     # The journal names both ends relative to the folder and to where it filed things, so they are
     # found again in a folder that was renamed, copied or mounted somewhere else since.
@@ -928,6 +1115,8 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     say(f"Undo {batch}: restored {restored:,}, skipped {len(skipped)}, removed {removed} folders it had created")
     for path, why in skipped[:10]:
         say(f"  ! {path}: {why}")
+    if skipped:
+        say(f"  `dewey undo '{root}' --batch {batch}` tries {'it' if len(skipped) == 1 else 'them'} again.")
     return dict(batch=batch, restored=restored, skipped=len(skipped), dirs_removed=removed,
                 skipped_items=[{"path": path, "why": why} for path, why in skipped])
 
@@ -1081,7 +1270,9 @@ def _sha256(data: bytes) -> str:
 
 
 def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan_id: int | None = None) -> dict:
-    """Every row of a plan as apply would see it now: the plan's values, the CSV's edits, the verdict."""
+    """Every row of a plan as apply would see it now: the plan's values, the CSV's edits, the verdict.
+
+    A row that has moved (`moved_rows`) has the verdict "moved", and its `dst` is where it is now."""
     plan = _latest_plan(conn, plan_id)
     pid = plan["id"]
     dest_root = plan_dest(conn, plan, root)
@@ -1090,10 +1281,17 @@ def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, 
     edits = edits_by_row(csv_rows)
     cats, homes = cfg["categories"], _homes(cfg)
     fence = Fence(root, dest_root)
+    done = moved_rows(conn, root, state_dir, pid)
+    db_rows = conn.execute("SELECT * FROM plan_rows WHERE plan_id=? ORDER BY row", (pid,)).fetchall()
     rows = []
-    for r in conn.execute("SELECT * FROM plan_rows WHERE plan_id=? ORDER BY row", (pid,)):
+    for r in db_rows:
         e = edits.get(r["row"])
         res = resolve_row(r, e, cats, homes, fence)
+        if r["row"] in done:
+            batch, now = done[r["row"]]
+            there = os.path.relpath(now, dest_root)
+            res = Resolution(res.status, res.dst if there.startswith("..") else there, res.category, "moved",
+                             f"moved by batch {batch}; undo that batch to move it again")
         typed = (res.status, _typed(e, r, "dst"), _typed(e, r, "category"))
         rows.append({"row": r["row"], "src": r["src"], "action": r["action"], "size": r["size"] or 0,
                      "status": res.status, "dst": res.dst, "category": res.category,
@@ -1106,7 +1304,7 @@ def plan_rows(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, 
     return {"plan_id": pid, "created": plan["created"], "decider": plan["decider"], "root": str(root),
             "dest_root": str(dest_root), "csv": str(csv_path),
             "report": str(report_path) if report_path.exists() else None,
-            "csv_sha256": _sha256(data), "summary": json.loads(plan["summary"] or "{}"),
+            "csv_sha256": _sha256(data), "summary": summary_now(db_rows, edits, done),
             "categories": [{"key": k, "path": v.get("path", ""), "desc": v.get("desc", "")} for k, v in cats.items()],
             "folder_kinds": [{"kind": k, "path": v} for k, v in homes.items()],
             "auto_confidence": p["auto_confidence"], "review_confidence": p["review_confidence"],

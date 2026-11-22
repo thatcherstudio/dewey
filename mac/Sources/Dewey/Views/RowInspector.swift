@@ -106,6 +106,12 @@ private struct OneRow: View {
 
             Divider()
 
+            if row.isMoved {
+                Label("Moved. To change where it went, put its batch back in History first.",
+                      systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.blue).font(.callout)
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 Picker("Status", selection: Binding(get: { row.status },
                                                     set: { review.setStatus($0, for: [row.id]) })) {
@@ -118,6 +124,7 @@ private struct OneRow: View {
                 .labelsHidden()
                 Text(StatusBadge.explanation(row.status)).font(.callout).foregroundStyle(.secondary)
             }
+            .disabled(row.isMoved)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Category").font(.headline)
@@ -129,14 +136,16 @@ private struct OneRow: View {
                 }
                 .labelsHidden()
             }
+            .disabled(row.isMoved)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Goes to").font(.headline)
+                Text(row.isMoved ? "Is now at" : "Goes to").font(.headline)
                 TextField("Folder/name, relative to the destination", text: $draft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .focused($editingDst)
                     .onSubmit(commit)
                     .onChange(of: editingDst) { _, focused in if !focused { commit() } }
+                    .disabled(row.isMoved)
                 Text(destinationNote).font(.caption).foregroundStyle(.secondary)
                 if row.verdict == "refused" {
                     Label(row.why, systemImage: "exclamationmark.triangle.fill")
@@ -178,9 +187,10 @@ private struct OneRow: View {
     }
 
     private var destinationNote: String {
+        let dest = review.plan.map { ($0.destRoot as NSString).lastPathComponent } ?? "the folder"
+        if row.isMoved { return "Inside \(dest)." }
         if row.verdict == "stay" && !row.pending { return "This category leaves it where it is." }
         if row.dstIsPreview { return "Where the new category puts it. Save to confirm the exact path." }
-        let dest = review.plan.map { ($0.destRoot as NSString).lastPathComponent } ?? "the folder"
         return "Inside \(dest). End with / to put it into that folder with its own name."
     }
 

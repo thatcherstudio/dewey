@@ -95,9 +95,10 @@ struct MoveRunView: View {
         .confirmUndo($undoRequest, folder: folder)
     }
 
+    /// The batch Undo is offered for: none when nothing moved.
     private var batch: String? {
         switch run.state {
-        case .finished(let r): r.batch
+        case .finished(let r): r.undoBatch
         case .stopped(let b): b
         case .running, .failed: nil
         }
@@ -134,7 +135,7 @@ struct MoveRunView: View {
                     ProblemList(title: "\(Self.rows(r.skipped.count + r.failed.count)) didn't move",
                                 lines: (r.skipped + r.failed).map { ($0.src, $0.text) })
                 }
-                if r.batch != nil {
+                if r.undoBatch != nil {
                     Notice(systemImage: "arrow.uturn.backward.circle", tint: .blue,
                            text: "Every move is in History. Undo puts \(r.counts.moved == 1 ? "it" : "them all") back "
                                  + "where \(r.counts.moved == 1 ? "it was" : "they were").")

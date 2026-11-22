@@ -205,17 +205,19 @@ struct ReviewView: View {
 }
 
 /// auto / review / skip as a coloured label, with marks for unsaved, changed and refused rows.
+/// A row that has moved says "Moved", whatever its status: it isn't waiting for anything.
 struct StatusBadge: View {
     let row: PlanReview.Row
 
     var body: some View {
+        let color = row.isMoved ? Color.blue : Self.color(row.status)
         HStack(spacing: 5) {
-            Text(Self.label(row.status))
+            Text(row.isMoved ? "Moved" : Self.label(row.status))
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 7)
                 .padding(.vertical, 2)
-                .foregroundStyle(Self.color(row.status))
-                .background(Self.color(row.status).opacity(0.16), in: Capsule())
+                .foregroundStyle(color)
+                .background(color.opacity(0.16), in: Capsule())
             if row.verdict == "refused" {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red).help(row.why)
             }
@@ -262,6 +264,8 @@ struct DestinationText: View {
     var body: some View {
         Group {
             switch row.verdict {
+            case "moved":
+                Text("moved to \(row.dst)").foregroundStyle(.secondary)
             case "stay" where !row.pending:
                 Text("stays where it is").foregroundStyle(.secondary)
             case "noop" where !row.pending:
@@ -272,7 +276,7 @@ struct DestinationText: View {
         }
         .lineLimit(1)
         .truncationMode(.middle)
-        .help(row.verdict == "refused" ? row.why : row.dst)
+        .help(row.verdict == "refused" || row.isMoved ? row.why : row.dst)
     }
 }
 
@@ -283,7 +287,7 @@ private struct FilterBar: View {
     let reveal: (Set<Int>) -> Void
 
     private static let titles: [PlanReview.Filter: String] = [
-        .all: "All", .auto: "Move", .review: "Review", .skip: "Skip", .duplicate: "Duplicates",
+        .all: "All", .auto: "Move", .review: "Review", .skip: "Skip", .moved: "Moved", .duplicate: "Duplicates",
         .folder: "Folders", .changed: "Changed", .problems: "Problems",
     ]
 

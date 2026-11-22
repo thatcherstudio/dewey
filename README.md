@@ -199,6 +199,9 @@ sqlite3 ~/Downloads/.dewey/catalog.db \
   don't count; a file whose own name starts or ends with a space keeps it.
 - `apply --dry-run` ends with an `--expect-sha` to copy. Given to the real `apply`, it moves those
   rows or, if the plan or a setting changed in between, nothing.
+- A row that has moved is done. Applying the plan again moves only the rows you approved since, and
+  `status`, `rows` and the app count the plan as its CSV says now. Undo the batch, and its rows can
+  move again.
 
 The CSV is saved as UTF-8 with a BOM, so Excel and Numbers open accented filenames correctly. When you
 save from Excel, choose "CSV UTF-8": plain "CSV" can mangle accented names, and those rows are then
@@ -228,6 +231,8 @@ refused (never mis-moved).
   A folder whose kind has a home in `[folders]` gets ONE `review` row that renames the whole folder
   into place (`birdhouse-v2/` → `3D & CAD/birdhouse-v2/`), contents untouched, same disk only.
   Nothing moves until you approve it; undo puts the folder back as one piece.
+- **A destination inside the folder** (`dest = "~/Downloads/Sorted"`): what is in it is filed. It
+  isn't planned again on the next run, and `Sorted` itself is never offered as a folder to move.
 - **Kept whole:** `.app`, `.photoslibrary`, `.fcpbundle`, `.pages`/`.numbers`/`.key`, VM packages
   (`.utm`, `.pvm`, `.vmwarevm`) and other bundles (plus any folder with `Contents/Info.plist`), and any
   project folder (one containing `.git`, `package.json`, `pyproject.toml`, `Makefile`, …: see
@@ -258,7 +263,11 @@ refused (never mis-moved).
   you name. Only a `dest` outside the folder stays where it was. In `dewey.toml`, `dest` is a full
   path (`/Volumes/…`, `~/…`); `--dest` in Terminal can be relative to where you are.
 - **Undo** restores files to their exact original paths, skips any file that was modified after the
-  move, and removes the folders the batch created (a lone `.DS_Store` from Finder counts as empty).
+  move, and removes the folders the batch created (a lone `.DS_Store` from Finder counts as empty),
+  the `dest` folder too when apply made it. A plain `dewey undo ROOT` takes the newest batch it can
+  still put something back from: an apply that moved nothing isn't a batch, and a batch whose last
+  undo put nothing back (its files were edited or locked since) is passed over and named, to ask
+  for with `--batch`.
 - **Moves stay between the folder and its destination.** A plan, a journal or a link inside the
   folder can't send a file anywhere else, or pull one in: every move is checked with links followed,
   at the moment it happens. A destination outside the folder (`dest`) is said out loud before

@@ -37,6 +37,12 @@ public struct ApplyPreview: Decodable, Sendable, Equatable {
     /// A fingerprint of `selected` (which rows, from where, to where). Move sends it back
     /// (`--expect-sha`), so dewey moves these rows or none (dewey before 0.2.1 has none).
     public var selectionSha256: String?
+    /// Rows of this plan that an earlier batch moved and that haven't been put back. They are not
+    /// in `selected` (dewey before 0.2.2 doesn't say, and listed them there again).
+    public var alreadyMoved: Int?
+
+    /// Nothing is left to move because what was to move has moved: the screen says so, with no Move.
+    public var hasMoved: Bool { selected.isEmpty && (alreadyMoved ?? 0) > 0 }
 
     /// "~/Sorted" when the files leave the folder, for the screen to say so before they move.
     public var leavesFolderFor: String? {
@@ -79,7 +85,7 @@ public struct ApplyResult: Decodable, Sendable, Equatable {
         public var text: String { why ?? error ?? "" }
     }
 
-    /// nil when there was nothing to move.
+    /// nil when nothing moved (dewey before 0.2.2 named a batch even then).
     public var batch: String?
     public var planId: Int
     public var destRoot: String?
@@ -89,6 +95,9 @@ public struct ApplyResult: Decodable, Sendable, Equatable {
     public var failed: [Problem]
     public var prunedDirs: [String]
     public var refused: [ApplyPreview.Refused]
+
+    /// The batch to offer Undo for: only when something moved.
+    public var undoBatch: String? { counts.moved > 0 ? batch : nil }
 
     public var movedFolders: Int { moved.reduce(0) { $0 + ($1.kind == "folder" ? 1 : 0) } }
     /// "4 files and 2 folders".

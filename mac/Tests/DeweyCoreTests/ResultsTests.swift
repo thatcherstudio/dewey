@@ -34,6 +34,36 @@ struct ResultsTests {
         #expect(s.errors == [PathError(path: "locked.pdf", error: "PermissionError: denied")])
     }
 
+    /// `status` with these batches (newest first) and this `undoable`.
+    private func status(batches: [String], undoable: String?, summary: String = "{}") throws -> FolderStatus {
+        let list = batches.map { #"{"batch": "\#($0)", "moves": 2, "undone": 0, "plan_id": 1}"# }.joined(separator: ", ")
+        let line = #"{"event": "result", "data": {"catalog": true, "root": "/x", "state": "/x/.dewey", "#
+            + #""plans": [{"id": 1, "created": "2026-11-21T09:00:00-05:00", "summary": \#(summary)}], "#
+            + #""batches": [\#(list)], "undoable": \#(undoable.map { "\"\($0)\"" } ?? "null")}}"#
+        return try decodeResult(line, as: FolderStatus.self)
+    }
+
+    @Test func canBeUndoneIsAboutTheLatestBatch() throws {
+        #expect(try status(batches: ["b2", "b1"], undoable: "b2").latestCanBeUndone)
+        // the latest batch holds only a file that can't go back: a plain undo would take the one before
+        #expect(try !status(batches: ["b2", "b1"], undoable: "b1").latestCanBeUndone)
+        #expect(try !status(batches: ["b1"], undoable: nil).latestCanBeUndone)  // everything is back
+        // 0.2.1 named an empty batch here, one the list doesn't have, and Overview said "Can be undone"
+        #expect(try !status(batches: ["b1"], undoable: "b1-002").latestCanBeUndone)
+        #expect(try !status(batches: [], undoable: nil).latestCanBeUndone)
+    }
+
+    @Test func aPlansCountsSayWhatHasMoved() throws {
+        let now = try status(batches: [], undoable: nil, summary: #"""
+            {"auto": {"n": 0, "bytes": 0}, "review": {"n": 80, "bytes": 800}, "skip": {"n": 12, "bytes": 5},
+             "duplicate": {"n": 0, "bytes": 0}, "folder": {"n": 0, "bytes": 0}, "moved": {"n": 120, "bytes": 999}}
+            """#)
+        #expect(now.latestPlan?.summary.moved == Bucket(n: 120, bytes: 999))
+        #expect(now.latestPlan?.summary.review.n == 80)
+        let older = try status(batches: [], undoable: nil, summary: #"{"auto": {"n": 7, "bytes": 393}}"#)
+        #expect(older.latestPlan?.summary.moved == Bucket())  // a dewey before 0.2.2 doesn't say
+    }
+
     @Test func aFolderNeverScannedIsNotAnError() throws {
         let line = #"{"event": "result", "data": {"catalog": false, "root": "/Users/x/new", "state": "/Users/x/new/.dewey"}}"#
         let s = try decodeResult(line, as: FolderStatus.self)

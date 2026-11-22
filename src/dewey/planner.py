@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import decide as dmod
 from . import folders as fkind
-from .catalog import UNIT_KINDS, check_safe_root, left_alone, now_iso, unsafe_root
+from .catalog import UNIT_KINDS, check_safe_root, left_alone, now_iso, unsafe_dest
 from .errors import DECIDER, NO_CATALOG, UNSAFE_DEST, DeweyExit
 from .progress import Progress, human_bytes, say
 from .rules import compile_rules, file_date, fill, first_match
@@ -134,7 +134,7 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
     dest_root = Path(p["dest"]).expanduser().resolve() if p["dest"] else root
     check_safe_root(root)
     if dest_root != root and root not in dest_root.parents:  # filing outside the folder
-        why = unsafe_root(dest_root)
+        why = unsafe_dest(dest_root)
         if why:
             raise DeweyExit(f"plan.dest: {dest_root} is no place to file into: {why}", UNSAFE_DEST)
         say(f"note: this plan files things into {dest_root}, outside this folder.")

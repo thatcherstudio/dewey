@@ -145,6 +145,16 @@ def unsafe_root(root: Path) -> str | None:
     return None
 
 
+def unsafe_dest(dest: Path) -> str | None:
+    """Why `dest` (resolved), a destination outside the folder being organized, is no place to file
+    into, or None. Everything a folder to organize may not be, and nothing hidden: `~/.ssh` and
+    `~/.config` hold keys and settings, and a file put there can be one that is acted on."""
+    why = unsafe_root(dest)
+    if not why and any(part.startswith(".") for part in dest.parts):
+        why = "it is hidden, or inside a hidden folder, where settings and keys are kept"
+    return why
+
+
 def check_safe_root(root: Path) -> None:
     why = unsafe_root(root)
     if why:

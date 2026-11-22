@@ -28,6 +28,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import stat
 from dataclasses import dataclass
@@ -35,10 +36,10 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from . import macos
-from .catalog import hash_file, now_iso, unsafe_root
+from .catalog import PARTIAL_SUFFIX, hash_file, now_iso, unsafe_dest, unsafe_root
 from .errors import BAD_EDIT, NO_PLAN, NOTHING_TO_UNDO, STALE, UNSAFE_DEST, DeweyExit
 from .planner import CSV_FIELDS, DECIDER_PREFIXES, norm_key, plan_files
-from .progress import Progress, human_bytes, say
+from .progress import Progress, human_bytes, json_mode, say
 
 try:
     import fcntl
@@ -63,6 +64,77 @@ class Journal:
         self.fh.close()
 
 
+class _Hold:
+    """Ctrl-C, Cancel and Quit (SIGINT, SIGTERM) wait for the file in hand.
+
+    Python turns a signal into a KeyboardInterrupt wherever it happens to be. In the middle of a move
+    that was between the link and the unlink (the file stayed under both names), or just after the
+    unlink, inside the `try` whose cleanup then removed the other name as well: the file was gone.
+    So while a batch moves files the signal is only noted, and `stop_if_asked()`, called between two
+    files, raises the KeyboardInterrupt there. Off the main thread Python delivers no signals, and
+    there is nothing to hold.
+    """
+
+    def __init__(self):
+        self.asked = False
+        self._saved: dict = {}
+
+    def begin(self) -> "_Hold":
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                if signal.getsignal(sig) is not signal.SIG_IGN:  # told to ignore it (`nohup`, a script): still ignored
+                    self._saved[sig] = signal.signal(sig, self._note)
+        except ValueError:  # not the main thread
+            pass
+        return self
+
+    def _note(self, signum, frame) -> None:
+        if not self.asked and not json_mode():  # in Terminal, a big copy to another disk can take minutes more
+            try:  # straight to the terminal: print() may be half way through a line of its own
+                os.write(2, b"\nStopping after the file in hand...\n")
+            except OSError:
+                pass
+        self.asked = True
+
+    def end(self) -> None:
+        for sig, handler in self._saved.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)  # None: set from C, not Python
+        self._saved = {}
+
+    def stop_if_asked(self) -> None:
+        if self.asked:
+            raise KeyboardInterrupt
+
+
+_IMMUTABLE = getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "SF_IMMUTABLE", 0)
+_APPEND_ONLY = getattr(stat, "UF_APPEND", 0) | getattr(stat, "SF_APPEND", 0)
+
+
+def _locked(st: os.stat_result) -> str | None:
+    """Why macOS won't rename or delete this, nor a copy of it (a copy gets the same flags), or None."""
+    flags = getattr(st, "st_flags", 0)
+    if flags & _IMMUTABLE:
+        return "locked in Finder (Get Info > Locked)"
+    if flags & _APPEND_ONLY:
+        return "marked append-only (chflags uappnd)"
+    return None
+
+
+def _one_file(a: Path, b: Path) -> bool:
+    """Two names of one regular file (hard links): what a move cut off between its link and its
+    unlink leaves behind. Neither name is followed if it is a link.
+
+    Two spellings of ONE name (`A.txt` and `a.txt` in the same folder of a disk that ignores case)
+    are not two names: taking one away would take the file."""
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+        if not stat.S_ISREG(sa.st_mode) or (sa.st_dev, sa.st_ino) != (sb.st_dev, sb.st_ino) or sa.st_nlink < 2:
+            return False
+        return norm_key(a.name) != norm_key(b.name) or not os.path.samefile(a.parent, b.parent)
+    except OSError:
+        return False
+
+
 def _noclobber_rename(src: Path, dst: Path) -> None:
     """Same-filesystem move that can never overwrite dst."""
     try:
@@ -79,9 +151,22 @@ def _noclobber_rename(src: Path, dst: Path) -> None:
         return
     try:
         os.unlink(src)
-    except BaseException:
+    except OSError:  # only when the unlink itself failed: anything else may arrive after it worked
+        if not os.path.lexists(src):  # it worked, whatever it said (a network disk can): the move is done
+            return
         os.unlink(dst)  # our own hard link to src; drop it so the file isn't in two places
         raise
+
+
+def _drop(partial: Path) -> None:
+    """Remove a partial copy. Never follows a link, and never raises: the error that led here is the
+    one to report. A copy of a locked file is locked too, and macOS deletes it only once unlocked."""
+    try:
+        if _locked(os.lstat(partial)):
+            os.chflags(partial, 0, follow_symlinks=False)
+        os.unlink(partial)
+    except (OSError, AttributeError, NotImplementedError):
+        pass
 
 
 def _sync(path) -> None:
@@ -110,7 +195,12 @@ def move_file(src: Path, dst: Path, expected_hash: str | None, algo: str | None)
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
-    tmp = dst.with_name(dst.name + ".dewey-partial")
+    tmp = dst.with_name(dst.name + PARTIAL_SUFFIX)
+    if os.path.lexists(tmp):  # left by a move that was cut off, or put there: never copied over or through
+        _drop(tmp)
+    # New and ours, or this move fails here: something under that name that couldn't be dropped (a
+    # link, in a folder that won't let go of it) is not written through.
+    os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     try:  # the copy itself is inside: a full disk or Ctrl-C mid-copy must not leave a partial behind
         shutil.copy2(src, tmp)
         macos.keep_metadata(src, tmp)  # Finder tags, "where from", creation date: copy2 drops them
@@ -119,7 +209,7 @@ def move_file(src: Path, dst: Path, expected_hash: str | None, algo: str | None)
         _sync(tmp)  # on the disk, not in a cache, before the only other copy is deleted
         _noclobber_rename(tmp, dst)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        _drop(tmp)
         raise
     try:
         try:
@@ -127,9 +217,10 @@ def move_file(src: Path, dst: Path, expected_hash: str | None, algo: str | None)
         except OSError:
             pass
         os.unlink(src)
-    except BaseException:
-        dst.unlink(missing_ok=True)  # our verified copy; the source is still intact
-        raise
+    except OSError:  # only when the unlink itself failed: anything else may arrive after it worked
+        if os.path.lexists(src):
+            dst.unlink(missing_ok=True)  # our verified copy; the source is still intact
+            raise
     return "copy+verify"
 
 
@@ -204,9 +295,14 @@ class Fence:
             self._real[key] = os.path.realpath(d)
         return self._real[key]
 
-    def dest_problem(self) -> str | None:
-        """Why nothing may be filed into this destination at all."""
-        why = unsafe_root(Path(self._dest)) if self.outside else None
+    def dest_problem(self, undoing: bool = False) -> str | None:
+        """Why nothing may be filed into this destination at all.
+
+        Undo only brings back what dewey itself put there (same hash, or the same folder), so it still
+        reaches a hidden folder that a dewey before 0.2.2 was allowed to file into."""
+        if not self.outside:
+            return None
+        why = (unsafe_root if undoing else unsafe_dest)(Path(self._dest))
         return f"{self.dest_root} is no place to file into: {why}" if why else None
 
     def problem(self, in_folder: str, in_dest: str, fresh: bool = False) -> str | None:
@@ -373,6 +469,43 @@ def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Res
     return Resolution(status, dst, category, "move")
 
 
+def _review_dirs(root: Path, dest_root: Path, review: str, r) -> set[str]:
+    """Every place inside the folder that is the review folder for this row, as `norm_key`s: the one
+    the settings name now and the one the plan named (the settings may have changed since), in the
+    folder and in a destination that is inside the folder."""
+    names = {review, r["dst"].split("/Duplicates/")[0] if "/Duplicates/" in (r["dst"] or "") else ""}
+    found = set()
+    for name in filter(None, names):
+        found.add(norm_key(name))
+        inside = os.path.relpath(dest_root / name, root)
+        if not inside.startswith(".."):
+            found.add(norm_key(inside))
+    return found
+
+
+def _kept_copy(conn, root: Path, r, to_review: set, review_dirs: set[str]) -> bool:
+    """A `duplicate` row may move only while another copy stays behind: one the catalog has under the
+    same hash, that is still where the catalog says, with the contents it had, and that is neither in
+    the review folder nor on its way there in this batch. The plan chose that copy when it was made;
+    the person may have deleted or edited it since, and then this row's file is the only one left
+    outside the folder the README says to empty."""
+    if not r["hash"]:
+        return False
+    for f in conn.execute("SELECT id, rel_path, size, mtime_ns, hash_algo FROM files "
+                          "WHERE hash=? AND kind='file' AND missing=0 AND id IS NOT ?", (r["hash"], r["file_id"])):
+        if f["id"] in to_review or any(norm_key(f["rel_path"]).startswith(d + "/") for d in review_dirs):
+            continue
+        there = root / f["rel_path"]
+        try:
+            st = os.lstat(there)
+            if stat.S_ISREG(st.st_mode) and st.st_size == f["size"] and (
+                    st.st_mtime_ns == f["mtime_ns"] or hash_file(str(there), f["hash_algo"]) == r["hash"]):
+                return True
+        except (OSError, ValueError, TypeError, ImportError):  # gone, unreadable, or a hash this dewey can't repeat
+            continue
+    return False
+
+
 def _selection_sha(pid: int, dest_root: Path, selected: list) -> str:
     """One fingerprint of what an apply would move: which rows, from where, to where. A dry run gives
     it out; `--expect-sha` on the real run then moves only if nothing changed in between (the CSV
@@ -473,9 +606,23 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
     moved, skipped, failed = [], [], []
     reserved: set[str] = set()
     created_dirs: set[str] = set()
+    review = str(cfg.get("plan", {}).get("review_dir") or "").strip("/")
+
+    def set_aside(r, dst: str) -> bool:
+        """A duplicate still going where the plan sent it, or into the review folder as it is named
+        now. Not one the person re-filed somewhere of their own: that is an ordinary move."""
+        if r["action"] != "duplicate":
+            return False
+        return (not review or norm_key(dst) == norm_key(r["dst"] or "")
+                or norm_key(dst).startswith(norm_key(review) + "/"))
+
+    to_review = {r["file_id"] for r, _status, dst, _category in selected if set_aside(r, dst)}
     prog = Progress("Moving", total=len(selected), total_bytes=total or None)
+    hold = _Hold()
     try:
+        hold.begin()  # from here to the end of the loop, Ctrl-C and Cancel wait for the file in hand
         for r, status, dst, category in selected:
+            hold.stop_if_asked()
             src_abs = root / r["src"]
             size = r["size"] or 0
             frow = files.get(r["file_id"])
@@ -505,7 +652,20 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
                     skipped.append({"row": r["row"], "src": r["src"], "why": "contents changed since the scan; rescan"})
                     prog.update(1, size)
                     continue
-            dst_abs = _free(dest_root / dst, reserved, keep_ext=not is_dir)
+            if _locked(st):  # macOS refuses to rename it, and a copy to another disk would be locked half way
+                skipped.append({"row": r["row"], "src": r["src"], "why": f"{_locked(st)}; unlock it to move it"})
+                prog.update(1, size)
+                continue
+            if set_aside(r, dst) and not _kept_copy(conn, root, r, to_review,
+                                                    _review_dirs(root, dest_root, review, r)):
+                skipped.append({"row": r["row"], "src": r["src"],
+                                "why": "the copy this duplicates is gone or changed, so this one stays; rescan"})
+                prog.update(1, size)
+                continue
+            # Already under both names: a batch that was cut off between its link and its unlink (a
+            # kill, a power cut, Cancel in 0.2.1) and wasn't undone. This move takes the old name away.
+            half_moved = not is_dir and _one_file(src_abs, dest_root / dst)
+            dst_abs = dest_root / dst if half_moved else _free(dest_root / dst, reserved, keep_ext=not is_dir)
             if is_dir and norm_key(str(dst_abs)).startswith(norm_key(str(src_abs)) + "/"):
                 skipped.append({"row": r["row"], "src": r["src"], "why": "dst is inside the folder itself"})
                 prog.update(1, size)
@@ -540,7 +700,11 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
                 dst_abs.parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.update(str(d) for d in missing_dirs)
                 j.write(rec)  # intent first: the journal is never behind the disk
-                how = move_dir(src_abs, dst_abs) if is_dir else move_file(src_abs, dst_abs, r["hash"], algo)
+                if half_moved:
+                    os.unlink(src_abs)
+                    how = "rename"
+                else:
+                    how = move_dir(src_abs, dst_abs) if is_dir else move_file(src_abs, dst_abs, r["hash"], algo)
             except Exception as ex:  # noqa: BLE001
                 j.write({"op": "failed", "row": r["row"], "error": f"{type(ex).__name__}: {ex}"})
                 failed.append({"row": r["row"], "src": r["src"], "error": f"{type(ex).__name__}: {ex}"})
@@ -576,6 +740,8 @@ def apply(conn: sqlite3.Connection, root: Path, cfg: dict, state_dir: Path, plan
         say(f"Stopped after {len(moved):,} of {len(selected):,} moves. `dewey undo '{root}'` puts them back "
             f"(batch {batch}).")
         raise
+    finally:
+        hold.end()
     prog.done()
     for r, label in rejected:  # label: the category the person chose instead (e.g. "other"), or None
         if (r["decided_by"] or "").startswith(DECIDER_PREFIXES):
@@ -725,9 +891,9 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     if not _same_folder(was_root, root):
         say(f"note: batch {batch} moved things when this folder was at {was_root}. It is undone here, in {root}.")
     fence = Fence(root, dest_root)
-    if fence.dest_problem():
-        raise DeweyExit(f"batch {batch} says it filed things outside this folder, but {fence.dest_problem()}. "
-                        "Nothing was put back.", UNSAFE_DEST)
+    if fence.dest_problem(undoing=True):
+        raise DeweyExit(f"batch {batch} says it filed things outside this folder, but "
+                        f"{fence.dest_problem(undoing=True)}. Nothing was put back.", UNSAFE_DEST)
     if fence.outside:
         say(f"note: batch {batch} filed things into {dest_root}, outside this folder; they come back from there.")
     mkdirs = [d for d in (_moved_with(Path(r["path"]), was_root, root) for r in recs
@@ -737,14 +903,18 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
     uj.write({"op": "undo", "batch": batch, "root": str(root), "dest_root": str(dest_root), "started": now_iso()})
     restored, skipped = 0, []
     prog = Progress("Undoing", total=len(moves), total_bytes=sum(m.get("size", 0) for m in moves) or None)
+    hold = _Hold()
     try:
-        restored = _put_back(conn, root, dest_root, fence, batch, moves, uj, skipped, prog)
+        hold.begin()  # Ctrl-C and Cancel wait for the file in hand, as they do in apply
+        restored = _put_back(conn, root, dest_root, fence, batch, moves, uj, skipped, prog, hold)
     except BaseException:  # Ctrl-C, Cancel, a full disk: what already went back is on record
         conn.commit()
         uj.close()
         prog.done()
         say(f"Stopped before everything was back. `dewey undo '{root}' --batch {batch}` puts back the rest.")
         raise
+    finally:
+        hold.end()
     prog.done()
     removed = 0
     for d in sorted(mkdirs, key=lambda p: -len(p.parts)):
@@ -762,12 +932,61 @@ def undo(conn: sqlite3.Connection, root: Path, state_dir: Path, batch: str | Non
                 skipped_items=[{"path": path, "why": why} for path, why in skipped])
 
 
+def _why_it_stays(rec: dict, dst: Path, is_dir: bool, outside: bool) -> str | None:
+    """Why what is at `dst` now isn't put back, or None when it is what dewey moved there, unchanged.
+
+    A file that can't be read (no permission, a disk that gives errors) can't be told from a changed
+    one, so it stays too. That is this one file's reason, not the end of the undo: the rest go back."""
+    try:
+        st = os.lstat(dst)
+        if is_dir:  # the folder goes back as one piece, whatever is in it now: nothing inside is lost
+            if not stat.S_ISDIR(st.st_mode):
+                return "no longer a folder; left where it is"
+            if outside and not _is_what_moved(rec, st, dst):
+                return ("can't tell that this is the folder dewey moved"
+                        + ("" if "inode" in rec else " (a batch from before 0.2.1)") + "; left where it is")
+        elif not stat.S_ISREG(st.st_mode):
+            return "no longer a regular file; left where it is"
+        elif outside:  # from outside the folder, only the very file dewey moved comes back
+            if not _is_what_moved(rec, st, dst):
+                return "isn't the file dewey moved (or was modified since); left where it is"
+        elif st.st_size != rec.get("size", 0) or (st.st_mtime_ns != rec.get("mtime_ns") and rec.get("algo")
+                                                   and hash_file(str(dst), rec["algo"]) != rec["hash"]):
+            return "file was modified after the move; left where it is"
+        if _locked(st):
+            return f"{_locked(st)}; unlock it and undo again"
+    except OSError as ex:
+        return f"can't be read ({ex.strerror or type(ex).__name__}); left where it is"
+    return None
+
+
+def _cut_off_copy(conn, batch: str, rec: dict, src: Path, dst: Path) -> bool:
+    """A copy to another disk that was cut off (a kill, a power cut) once the copy had its name and
+    before the original was removed: the journal has the move, the catalog never got it, and both
+    files are, byte for byte, the one the journal names. Taking the copy away is all that is left of
+    putting it back. After a move that finished, a file at the old place is somebody's own."""
+    if rec.get("algo") not in ("sha256", "blake3") or not isinstance(rec.get("hash"), str):
+        return False
+    if conn.execute("SELECT 1 FROM moves WHERE batch=? AND row=?", (batch, rec.get("row"))).fetchone():
+        return False
+    try:
+        for p in (src, dst):
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != rec.get("size") \
+                    or hash_file(str(p), rec["algo"]) != rec["hash"]:
+                return False
+    except (OSError, ImportError):
+        return False
+    return True
+
+
 def _put_back(conn, root: Path, dest_root: Path, fence: Fence, batch: str, moves: list, uj: Journal,
-              skipped: list, prog: Progress) -> int:
+              skipped: list, prog: Progress, hold: _Hold) -> int:
     """Undo's moves, newest first. Each one is committed as it lands, as apply's are: an undo that is
     stopped half way has put back exactly what History says it has."""
     restored = 0
     for rec in reversed(moves):
+        hold.stop_if_asked()
         size = rec.get("size", 0)
         is_dir = rec.get("kind") == "folder"
         if not (_is_rel(rec.get("from_rel")) and _is_rel(rec.get("to_rel"))):
@@ -780,6 +999,8 @@ def _put_back(conn, root: Path, dest_root: Path, fence: Fence, batch: str, moves
             skipped.append((str(dst), why))
             prog.update(1, size)
             continue
+        if not is_dir and os.path.lexists(dst.with_name(dst.name + PARTIAL_SUFFIX)):
+            _drop(dst.with_name(dst.name + PARTIAL_SUFFIX))  # a copy to another disk that was cut off part way
         if not os.path.lexists(dst):
             if not os.path.lexists(src):
                 skipped.append((str(dst), f"{'folder' if is_dir else 'file'} is at neither location"))
@@ -792,59 +1013,42 @@ def _put_back(conn, root: Path, dest_root: Path, fence: Fence, batch: str, moves
                              (now_iso(), batch, rec["row"]))
             prog.update(1, size)
             continue
-        if os.path.lexists(src):
-            skipped.append((str(dst), "something now exists at the original path"))
-            prog.update(1, size)
-            continue
-        if is_dir:  # the folder goes back as one piece, whatever is in it now: nothing inside is lost
-            if not stat.S_ISDIR(os.lstat(dst).st_mode):
-                skipped.append((str(dst), "no longer a folder; left where it is"))
-                prog.update(1, size)
-                continue
-            if fence.outside and not _is_what_moved(rec, os.lstat(dst), dst):
-                skipped.append((str(dst), "can't tell that this is the folder dewey moved"
-                                          + ("" if "inode" in rec else " (a batch from before 0.2.1)")
-                                          + "; left where it is"))
-                prog.update(1, size)
-                continue
-            src.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                move_dir(dst, src)
-            except Exception as ex:  # noqa: BLE001
-                skipped.append((str(dst), f"{type(ex).__name__}: {ex}"))
-                prog.update(1, size)
-                continue
-            uj.write({"op": "restore", "row": rec["row"], "from": str(dst), "to": str(src), "at": now_iso()})
-            _repoint_tree(conn, root, dst, src)
-            conn.execute("UPDATE moves SET undone_at=? WHERE batch=? AND row=?", (now_iso(), batch, rec["row"]))
-            conn.commit()
-            restored += 1
-            prog.update(1, size)
-            continue
-        st = os.lstat(dst)
-        if not stat.S_ISREG(st.st_mode):
-            skipped.append((str(dst), "no longer a regular file; left where it is"))
-            prog.update(1, size)
-            continue
-        if fence.outside:  # from outside the folder, only the very file dewey moved comes back
-            if not _is_what_moved(rec, st, dst):
-                skipped.append((str(dst), "isn't the file dewey moved (or was modified since); left where it is"))
-                prog.update(1, size)
-                continue
-        elif st.st_size != size or (st.st_mtime_ns != rec.get("mtime_ns") and rec.get("algo")
-                                    and hash_file(str(dst), rec["algo"]) != rec["hash"]):
-            skipped.append((str(dst), "file was modified after the move; left where it is"))
-            prog.update(1, size)
-            continue
-        src.parent.mkdir(parents=True, exist_ok=True)
         try:
-            move_file(dst, src, rec.get("hash"), rec.get("algo"))
+            if os.path.lexists(src):
+                # One file under both names: a move, or an undo, that was cut off between its link and
+                # its unlink (a crash, a Force Quit, Cancel in 0.2.1). It is back already; only the
+                # second name is left to take away. A copy to another disk that was cut off the same
+                # way left two files instead.
+                if is_dir or not (_one_file(src, dst) or _cut_off_copy(conn, batch, rec, src, dst)):
+                    skipped.append((str(dst), "something now exists at the original path"))
+                    prog.update(1, size)
+                    continue
+                os.unlink(dst)
+            else:
+                why = _why_it_stays(rec, dst, is_dir, fence.outside)
+                if why:
+                    skipped.append((str(dst), why))
+                    prog.update(1, size)
+                    continue
+                try:  # a file sitting where its old folder was stops this one, not the whole undo
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as ex:
+                    skipped.append((str(dst), f"the folder it was in can't be made again "
+                                              f"({ex.strerror or type(ex).__name__}); left where it is"))
+                    prog.update(1, size)
+                    continue
+                if is_dir:
+                    move_dir(dst, src)
+                else:
+                    move_file(dst, src, rec.get("hash"), rec.get("algo"))
         except Exception as ex:  # noqa: BLE001
             skipped.append((str(dst), f"{type(ex).__name__}: {ex}"))
             prog.update(1, size)
             continue
         uj.write({"op": "restore", "row": rec["row"], "from": str(dst), "to": str(src), "at": now_iso()})
-        if rec.get("file_id"):
+        if is_dir:
+            _repoint_tree(conn, root, dst, src)
+        elif rec.get("file_id"):
             _repoint(conn, rec["file_id"], root, src)
         conn.execute("UPDATE moves SET undone_at=? WHERE batch=? AND row=?", (now_iso(), batch, rec["row"]))
         conn.commit()

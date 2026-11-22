@@ -207,6 +207,8 @@ refused (never mis-moved).
 ## Safety
 
 - **Nothing is deleted.** Duplicates, empties and junk go to `_Review/` for you to empty yourself.
+  A duplicate goes there only while the copy that stays is still in its place, unchanged. If you
+  deleted or edited that copy after the plan was made, the duplicate stays where it is.
   The only exception is `--prune-empty`, which removes folders the move left empty (a lone
   `.DS_Store` counts as empty).
 - **No overwrites.** Moves use hard-link + unlink (atomic, fails if the name is taken). Where a filesystem
@@ -232,8 +234,14 @@ refused (never mis-moved).
   `project_markers`) are cataloged as one unit and never opened or split.
 - **Interrupted?** Each move is committed as it happens, and a batch stopped by a crash, Ctrl-C or a
   closed terminal still shows up for a plain `dewey undo ROOT`. An undo that is stopped has put
-  back what it says it has; run it again for the rest. Ctrl-C during a scan or a plan
+  back what it says it has; run it again for the rest. Ctrl-C, Cancel and Quit during a move or
+  an undo wait for the file in hand, so no file is stopped half way. A crash or a power cut in
+  the middle of a move can leave one file in both its old and its new place, or a
+  `.dewey-partial` on another disk; undo takes those away again. One file undo can't read or put
+  back is skipped with the reason, and the rest come back. Ctrl-C during a scan or a plan
   keeps the hashes and answers so far and exits at once, without waiting for a file it is stuck on.
+- **Locked files stay.** A file locked in Finder (Get Info > Locked) can't be renamed or deleted,
+  so `apply` and `undo` skip it and say so. Unlock it and run them again.
 - **Never touched:** symlinks (recorded, not followed: no cycles, nothing outside the root),
   iCloud "Optimize Storage" placeholders (cataloged but not read, so a scan doesn't download your
   iCloud Drive), and `.DS_Store`.

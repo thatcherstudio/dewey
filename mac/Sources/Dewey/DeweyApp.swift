@@ -83,8 +83,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             installing ? "Installing Laya stops too. What it downloaded is kept, so installing again picks up from there."
                 : nil,
         ].compactMap { $0 }.joined(separator: " ")
-        alert.addButton(withTitle: "Stop and Quit")
-        alert.addButton(withTitle: "Keep Running")
+        let stop = alert.addButton(withTitle: "Stop and Quit")
+        let keep = alert.addButton(withTitle: "Keep Running")
+        if busy.contains(where: { $0.moveRun?.isActive == true || $0.undoRun?.isActive == true }) {
+            stop.keyEquivalent = ""    // Return keeps a move going: a stray key press shouldn't leave
+            keep.keyEquivalent = "\r"  // a folder half organized
+        }
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
     }
 

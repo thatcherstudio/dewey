@@ -157,6 +157,12 @@ http.server.HTTPServer((os.environ["LAYA_HOST"], int(os.environ["LAYA_PORT"])), 
 
 @MainActor @Suite(.timeLimit(.minutes(1)))
 struct LayaControllerTests {
+    /// How long a stand-in server may take to answer. It answers in a second on a Mac with nothing
+    /// else to do. On GitHub's, with every test running at once, it took 9 s at 0.2.1 and more than
+    /// the 10 s these tests then gave it once 0.2.2 had added its tests. A wait ends when the server
+    /// answers, so a long one costs nothing when all is well.
+    static let serverWait: Double = 30
+
     @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
     func startsWaitsForHealthAndStops() async throws {
         let exe = try tempDir().appending(path: "laya-serve")
@@ -168,7 +174,7 @@ struct LayaControllerTests {
 
         await laya.start(executable: exe)
         #expect(laya.isRunning && laya.ownsServer)
-        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = laya.status { true } else { false } }
         #expect(laya.status == .ready(.init(loaded: ["english"], device: "cpu")))
         try await waitFor(seconds: 2) { laya.log.contains("fake laya on 127.0.0.1 \(port)") }
 
@@ -186,7 +192,7 @@ struct LayaControllerTests {
         let base = URL(string: "http://127.0.0.1:\(port)")!
         let first = LayaController(baseURL: base)
         await first.start(executable: exe)
-        try await waitFor(seconds: 10) { if case .ready = first.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = first.status { true } else { false } }
 
         let second = LayaController(baseURL: base)  // e.g. a laya-serve already running in Terminal
         await second.start(executable: exe)
@@ -204,7 +210,7 @@ struct LayaControllerTests {
         let laya = LayaController(baseURL: URL(string: "http://127.0.0.1:\(Int.random(in: 60_001...65_000))")!)
         await laya.start(executable: exe)
         #expect(laya.executable == exe)
-        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = laya.status { true } else { false } }
 
         await laya.stopAndWait()
         #expect(!laya.isRunning && laya.executable == nil)
@@ -277,7 +283,7 @@ struct LayaControllerTests {
                                   startupLimit: 1)
         await laya.start(executable: exe)
         try await waitFor(seconds: 8) { if case .failed = laya.status { true } else { false } }
-        try await waitFor(seconds: 12) { if case .ready = laya.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = laya.status { true } else { false } }
         #expect(laya.status == .ready(.init(loaded: ["english"], device: "cpu")))
         await laya.stopAndWait()
     }
@@ -293,7 +299,7 @@ struct LayaControllerTests {
         async let second: Void = laya.start(executable: exe)
         _ = await (first, second)
         #expect(laya.isRunning && laya.ownsServer)
-        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = laya.status { true } else { false } }
         let starts = try String(contentsOfFile: exe.path + ".starts", encoding: .utf8)
         #expect(starts == "started\n")
         await laya.stopAndWait()
@@ -311,7 +317,7 @@ struct LayaControllerTests {
         let base = URL(string: "http://127.0.0.1:\(port)")!
         let laya = LayaController(baseURL: base, record: record)
         await laya.start(executable: exe)
-        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        try await waitFor(seconds: Self.serverWait) { if case .ready = laya.status { true } else { false } }
         let note = try #require(LayaController.read(record))
         let running = try #require(RunningProcess.find(note.pid))
         #expect(note.port == port && note.startSec == running.startSec && note.startUsec == running.startUsec)
@@ -345,7 +351,7 @@ struct LayaControllerTests {
         let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         let pid = try #require(Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)))
         defer { kill(pid, SIGKILL) }  // whatever the test finds, nothing outlives it
-        try await waitFor(seconds: 10) { await LayaController.probe(base) != .refused }
+        try await waitFor(seconds: Self.serverWait) { await LayaController.probe(base) != .refused }
         let orphan = try #require(RunningProcess.find(pid))
         #expect(orphan.parent == 1)
         try JSONEncoder().encode(ServerRecord(pid: pid, startSec: orphan.startSec, startUsec: orphan.startUsec, port: port))

@@ -189,7 +189,8 @@ sqlite3 ~/Downloads/.dewey/catalog.db \
 `status` is `auto`, `review` or `skip`. `apply` moves `auto` rows (plus `review` rows with `--include-review`).
 
 - **Approve** a review or unsure row: set `status` to `auto`.
-- **Reject** a row: set `status` to `skip`, or delete the line. Rejected model rows are logged as negative labels.
+- **Reject** a row: set `status` to `skip`. A row the model decided is then logged as a negative label
+  at the next `apply` that moves something. Deleting the line skips the row too, but logs no label.
 - **Correct** a row: change `category` to another folder key from `dewey.toml` (dst is recomputed), or edit `dst` directly.
   `category = other` (any key with `path = ""`) means "leave it here" and is saved as a correction label.
   A misspelled category is refused, so the row doesn't move. A `dst` ending in `/`, or naming a folder

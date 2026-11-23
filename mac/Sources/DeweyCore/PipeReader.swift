@@ -110,17 +110,25 @@ final class PipeCollector: @unchecked Sendable {  // `data` is only touched on `
 
 /// Splits chunks into lines. Only touched from one handle's readability queue, which is serial.
 final class LineBuffer: @unchecked Sendable {
+    /// The start of a line whose end hasn't come yet. It never holds a newline.
     private var pending = Data()
 
+    /// The lines `chunk` completes. Only the chunk is searched for line ends: 0.2.1 searched all of
+    /// `pending` again for each chunk. `dewey rows` answers with one line for the whole plan,
+    /// megabytes long for a big one, and a plan of 100,000 rows took over a minute to read.
     func append(_ chunk: Data) -> [String] {
-        pending.append(chunk)
-        var lines: [String] = []
-        var start = pending.startIndex
-        while let nl = pending[start...].firstIndex(of: 0x0A) {
-            lines.append(String(decoding: pending[start..<nl], as: UTF8.self))
-            start = pending.index(after: nl)
+        guard let first = chunk.firstIndex(of: 0x0A) else {
+            pending.append(chunk)
+            return []
         }
-        if start != pending.startIndex { pending = Data(pending[start...]) }
+        pending.append(chunk[chunk.startIndex..<first])
+        var lines = [String(decoding: pending, as: UTF8.self)]
+        var start = chunk.index(after: first)
+        while let nl = chunk[start...].firstIndex(of: 0x0A) {
+            lines.append(String(decoding: chunk[start..<nl], as: UTF8.self))
+            start = chunk.index(after: nl)
+        }
+        pending = Data(chunk[start...])
         return lines
     }
 

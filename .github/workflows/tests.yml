@@ -1,5 +1,7 @@
 # What `make test` runs, on a Mac GitHub provides: the Python tests on the oldest Python dewey
-# supports and on the one the app bundles, then the app's own tests against that dewey.
+# supports and on the one the app bundles, then the app's own tests against that dewey. Then what
+# `make test-app` runs: Dewey.app is built the way the README says, and both sets of tests run
+# again with the Python and the dewey inside it.
 name: Tests
 
 on:
@@ -41,3 +43,24 @@ jobs:
         run: |
           swift --version
           make test-mac
+
+  app:
+    name: Dewey.app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # The build needs uv (it brings the app's Python). Homebrew is how the README installs it.
+      - name: Install uv
+        run: |
+          command -v uv || brew install uv
+          uv --version
+      # scripts/build-app.sh: a release build, signed, with the packages in constraints.txt. Until
+      # 0.2.2 nothing here ran it: a change that broke the build, or a test under the app's own
+      # Python, would go unseen until someone built the app.
+      - name: Build the app, then test with what is inside it
+        run: |
+          swift --version
+          make test-app

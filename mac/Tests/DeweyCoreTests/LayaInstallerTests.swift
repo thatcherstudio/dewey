@@ -129,6 +129,25 @@ struct LayaInstallerTests {
         #expect(!FileManager.default.fileExists(atPath: installer.layout.layaServe.path))
     }
 
+    /// Two clicks on Install Laya before the first has got going: it starts by measuring what an
+    /// earlier try left, off the main thread, and 0.2.1 only counted as running after that. Both
+    /// installs then ran, into the same folder at once.
+    @Test func aSecondInstallWhileOneIsStartingDoesNothing() async throws {
+        let dir = try tempDir()
+        let uv = try makeUV(in: dir)
+        let layout = LayaInstaller.Layout(root: dir.appending(path: "Laya"))
+        let installer = LayaInstaller(layout: layout)
+        let first = Task { await installer.install(uv: uv) }
+        let second = Task { await installer.install(uv: uv) }
+        await first.value
+        await second.value
+
+        #expect(installer.state == .finished)
+        let calls = try String(contentsOf: layout.root.appending(path: "calls.log"), encoding: .utf8)
+        #expect(calls.components(separatedBy: "uv python install").count == 2, "one install: \(calls)")
+        #expect(calls.components(separatedBy: "uv pip install").count == 2)
+    }
+
     @Test func notEnoughSpaceStopsBeforeDownloading() async throws {
         let dir = try tempDir()
         let installer = LayaInstaller(layout: .init(root: dir.appending(path: "Laya")))

@@ -94,6 +94,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --sign - "$APP" >/dev/null 2>&1
+# codesign says "replacing existing signature" each time it works, so what it prints is kept back
+# and shown only when it fails. 0.2.1 threw it away, and a build that couldn't be signed stopped
+# here without a word.
+if ! signing="$(codesign --force --sign - "$APP" 2>&1)"; then
+    echo "Couldn't sign $APP:" >&2
+    echo "$signing" >&2
+    exit 1
+fi
 codesign --verify "$APP"
 echo "Built $APP (dewey $VERSION, uv $("$APP/Contents/Resources/bin/uv" --version | cut -d' ' -f2), build $BUILD). Open it: open $APP"

@@ -72,7 +72,8 @@ trust_chat_confidence = false   # chat LLMs self-report confidence (uncalibrated
 # Match keys (all optional; every key given must match):
 #   ext = [".pdf"], name_regex = "...", path_regex = "...", min_size / max_size (bytes), has_camera = true
 # target/reason placeholders: {review} {year} {month} {camera}
-#   {year}/{month} come from photo EXIF when available, else the file's modified date.
+#   {year}/{month} come from photo EXIF when available, else a date in the file's name
+#   ("Screenshot 2025-03-04 at 10.15.png", "scan_2024_11_02.pdf"), else its modified date.
 
 [[rules]]
 name = "empty"

@@ -221,8 +221,15 @@ struct UndoRunView: View {
     }
 }
 
-/// Rows that didn't move or go back, with dewey's reason for each.
+/// Rows that didn't move or go back, with dewey's reason for each: the first `limit` of them, then
+/// how many more there are. The title counts them all.
+///
+/// 0.2.1 made a line for every one. A plan whose files are gone (their disk unplugged, the folder
+/// emptied since the scan) skips every row, and at 20,000 of them the window stopped answering:
+/// two minutes on, it still hadn't drawn.
 struct ProblemList: View {
+    static let limit = 200
+
     let title: String
     let lines: [(path: String, why: String)]
     @State private var expanded = true
@@ -231,10 +238,13 @@ struct ProblemList: View {
         DisclosureGroup(isExpanded: $expanded) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
-                    ForEach(lines.indices, id: \.self) { i in
+                    ForEach(lines.prefix(Self.limit).indices, id: \.self) { i in
                         (Text(lines[i].path).fontWeight(.medium) + Text(": \(lines[i].why)").foregroundColor(.secondary))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if lines.count > Self.limit {
+                        Text("… and \(ProgressText.count(lines.count - Self.limit)) more").foregroundStyle(.secondary)
                     }
                 }
                 .padding(.vertical, 6)

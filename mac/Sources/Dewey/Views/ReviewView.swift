@@ -69,17 +69,25 @@ struct ReviewView: View {
 
     // MARK: - parts
 
+    /// A notice's text wraps, and it isn't in a scroll view, so it needs a least width of its own
+    /// (see ApplyView). Without one, in the smallest window, a long notice ("plan-1.csv was changed
+    /// outside Dewey…") put the table, the sidebar and the notice itself off screen. Narrower than
+    /// Apply's 480, because the details pane leaves this column about 260 points of that window.
+    private static let noticeMinWidth: CGFloat = 220
+
     @ViewBuilder
     private var messages: some View {
         if let error = review.error {
             Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: error.errorDescription ?? "\(error)") {
                 Button("Reload") { Task { await review.reload() } }
             }
+            .frame(minWidth: Self.noticeMinWidth)
             .padding([.horizontal, .top], 12)
         } else if let notice = review.notice {
             Notice(systemImage: "info.circle", tint: .blue, text: notice) {
                 Button("OK") { review.notice = nil }
             }
+            .frame(minWidth: Self.noticeMinWidth)
             .padding([.horizontal, .top], 12)
         }
     }

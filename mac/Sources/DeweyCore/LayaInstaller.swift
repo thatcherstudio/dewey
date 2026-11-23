@@ -125,8 +125,15 @@ public final class LayaInstaller {
     }
 
     /// Runs all three steps with `uv` and returns when they finished, failed or were cancelled.
+    /// A call while an install or a remove is under way does nothing.
     public func install(uv: URL) async {
-        guard !isRunning else { return }
+        guard !isRunning, !isRemoving else { return }
+        // Running from here on, before the first wait. 0.2.1 said so only after `prepare()`, which
+        // waits while it measures what an earlier try left: a second click on Install Laya in that
+        // time started a second install into the same folder, and Remove could delete under it.
+        state = .running(.python)
+        stepBytes = 0
+        stepTotal = Step.python.estimate
         cancelled = false
         log = []
         fraction = 0

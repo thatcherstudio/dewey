@@ -76,8 +76,99 @@ private func tempFolder() throws -> URL {
     }
 }
 
+/// The ids the lists use (which rule is selected, which field has the cursor) across a new read of
+/// the settings, where every item starts with an id of its own (0.2.2, group C).
+@Suite struct SettingsIDTests {
+    private func config(rules: [FolderConfig.Rule], categories: [FolderConfig.Category] = []) -> FolderConfig {
+        FolderConfig(
+            plan: .init(dest: "", reviewDir: "_Review", keepDuplicate: "oldest", autoConfidence: 0.85,
+                        reviewConfidence: 0.5, maxDepth: 0),
+            decider: .init(backend: "none", url: "", model: "", trustChatConfidence: false),
+            folders: .init(move: true, kinds: []), rules: rules, categories: categories)
+    }
+
+    @Test func theSameRulesReadAgainKeepTheirIDs() {
+        let old = config(rules: [.init(name: "a", target: "A"), .init(name: "b", target: "B")],
+                         categories: [.init(key: "x"), .init(key: "y")])
+        let read = config(rules: [.init(name: "a", target: "A"), .init(name: "b", target: "B")],
+                          categories: [.init(key: "x"), .init(key: "y")])
+        #expect(read.rules.map(\.id) != old.rules.map(\.id))  // as decoded: new ids
+        let kept = read.keepingIDs(of: old)
+        #expect(kept.rules.map(\.id) == old.rules.map(\.id))
+        #expect(kept.categories.map(\.id) == old.categories.map(\.id))
+        #expect(kept == read)
+    }
+
+    @Test func aRuleKeepsItsIDWhenItMovesOrChanges() {
+        let old = config(rules: [.init(name: "a", target: "A"), .init(name: "b", target: "B"),
+                                 .init(name: "c", target: "C")])
+        // Revert after editing: b comes back with its old target, the list is in the file's order
+        let read = config(rules: [.init(name: "c", target: "C"), .init(name: "b", target: "Elsewhere"),
+                                  .init(name: "a", target: "A")])
+        let kept = read.keepingIDs(of: old)
+        #expect(kept.rules.map(\.id) == [old.rules[2].id, old.rules[1].id, old.rules[0].id])
+    }
+
+    @Test func aRenamedRuleKeepsItsPlaceAndANewOneGetsItsOwnID() {
+        let old = config(rules: [.init(name: "a", target: "A"), .init(name: "draft", target: "B")])
+        let read = config(rules: [.init(name: "a", target: "A"), .init(name: "final", target: "B2"),
+                                  .init(name: "new", target: "N")])
+        let kept = read.keepingIDs(of: old)
+        #expect(kept.rules[0].id == old.rules[0].id)
+        #expect(kept.rules[1].id == old.rules[1].id)  // same place, another name and target
+        #expect(kept.rules[2].id == read.rules[2].id)
+        #expect(Set(kept.rules.map(\.id)).count == 3)
+    }
+
+    @Test func aFolderNameIsMatchedWithoutTheSpacesAroundIt() {
+        let old = config(rules: [], categories: [.init(key: "money ", path: "Money"), .init(key: "work")])
+        let read = config(rules: [], categories: [.init(key: "work"), .init(key: "money", path: "Money")])
+        let kept = read.keepingIDs(of: old)  // dewey saved the name trimmed
+        #expect(kept.categories.map(\.id) == [old.categories[1].id, old.categories[0].id])
+    }
+}
+
 @MainActor @Suite(.enabled(if: realDewey != nil, "needs ~/.venvs/dewey (see README)"), .timeLimit(.minutes(1)))
 struct SettingsWithDeweyTests {
+    @Test func theSelectedRuleIsStillThatRuleAfterSaveAndAfterReadingAgain() async throws {
+        let root = try tempFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let settings = FolderSettings(cli: DeweyCLI(executable: realDewey!), root: root.path)
+        await settings.load()
+        let rule = FolderConfig.Rule(name: "recipes", target: "Documents/Recipes")
+        settings.draft?.rules.insert(rule, at: 0)
+        let ids = try #require(settings.draft?.rules.map(\.id))
+        let folders = try #require(settings.draft?.categories.map(\.id))
+        #expect(await settings.save())
+        #expect(settings.draft?.rules.map(\.id) == ids)  // 0.2.1: all new, so the editor closed
+        #expect(settings.draft?.categories.map(\.id) == folders)
+        await settings.load()  // coming back to the app
+        #expect(settings.draft?.rules.map(\.id) == ids)
+        settings.draft?.rules[0].target = "Elsewhere"
+        settings.revert()
+        #expect(settings.draft?.rules.map(\.id) == ids)
+        #expect(settings.draft?.rules[0].target == "Documents/Recipes")
+    }
+
+    @Test func whatIsTypedWhileASaveRunsStaysInTheForm() async throws {
+        let root = try tempFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let settings = FolderSettings(cli: DeweyCLI(executable: realDewey!), root: root.path)
+        await settings.load()
+        settings.draft?.plan.reviewDir = "_Check"
+        let save = Task { await settings.save() }
+        while !settings.saving { try await Task.sleep(for: .milliseconds(2)) }
+        settings.draft?.plan.reviewDir = "_Check These"  // two more words, typed after ⌘S
+        await settings.load()                            // and a read that starts meanwhile is not made
+        #expect(await save.value)
+        #expect(settings.saved?.plan.reviewDir == "_Check")
+        #expect(settings.draft?.plan.reviewDir == "_Check These")  // 0.2.1: back to "_Check"
+        #expect(settings.hasChanges && settings.canSave)
+        #expect(await settings.save())
+        let toml = try String(contentsOf: root.appending(path: ".dewey/dewey.toml"), encoding: .utf8)
+        #expect(toml.contains("review_dir = \"_Check These\""))
+    }
+
     @Test func aNewFolderShowsTheDefaultsAndSavingAFolderWritesIt() async throws {
         let root = try tempFolder()
         defer { try? FileManager.default.removeItem(at: root) }

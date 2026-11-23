@@ -59,8 +59,12 @@ struct Sidebar: View {
                         .contextMenu {
                             Button("Show in Finder") { folder.showInFinder() }
                             Divider()
-                            Button("Remove from Sidebar") { model.removeFolder(path) }
-                                .disabled(folder.isRunning)
+                            Button(folder.hasUnsavedChanges || folder.hasUnsavedSettings
+                                   ? "Remove from Sidebar…" : "Remove from Sidebar") {
+                                // once the menu has closed: an alert opened from inside it can stall
+                                Task { @MainActor in model.askToRemoveFolder(path) }
+                            }
+                            .disabled(folder.isRunning)
                         }
                 }
                 .onMove { model.folders.move(fromOffsets: $0, toOffset: $1) }

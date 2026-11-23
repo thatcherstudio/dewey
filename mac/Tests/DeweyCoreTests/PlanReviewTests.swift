@@ -397,3 +397,127 @@ extension PlanReviewWithDeweyTests {
         #expect(status.batches.isEmpty)
     }
 }
+
+// MARK: - changes made while a save or a reload is running (0.2.2, group C)
+
+extension PlanReviewTests {
+    private func rows() throws -> [Int: PlanRow] {
+        let plan = try DeweyEvent.decoder().decode(PlanRows.self, from: Data(rowsJSON.utf8))
+        return Dictionary(uniqueKeysWithValues: plan.rows.map { ($0.row, $0) })
+    }
+
+    @Test func whatWasSentAndNotTouchedSinceIsSaved() throws {
+        let sent = [2: PlanReview.Edit(status: "auto"), 3: PlanReview.Edit(category: "work")]
+        #expect(PlanReview.unsaved(after: sent, now: sent, rows: try rows()).isEmpty)
+    }
+
+    @Test func aChangeMadeWhileTheSaveRanIsStillUnsaved() throws {
+        let sent = [2: PlanReview.Edit(status: "auto")]
+        var now = sent
+        now[4] = PlanReview.Edit(status: "skip")                    // another row
+        now[2] = PlanReview.Edit(status: "auto", category: "finance")  // another field of the row sent
+        let left = PlanReview.unsaved(after: sent, now: now, rows: try rows())
+        #expect(left[4] == PlanReview.Edit(status: "skip"))
+        #expect(left[2]?.category == "finance")
+        #expect(left.count == 2)
+    }
+
+    @Test func aRowPutBackWhileTheSaveRanIsAChangeAgain() throws {
+        // Row 2 is "review" in the CSV. Approve, Save, and before the save answers, back to review:
+        // nothing is pending by then, but the CSV is about to say "auto".
+        let sent = [2: PlanReview.Edit(status: "auto", category: "finance"), 3: PlanReview.Edit(dst: "Archive/")]
+        let now = [2: PlanReview.Edit(category: "finance")]
+        let left = PlanReview.unsaved(after: sent, now: now, rows: try rows())
+        #expect(left[2] == PlanReview.Edit(status: "review", category: "finance"))
+        #expect(left[3] == PlanReview.Edit(dst: "Code/a.py"))  // "Undo Unsaved Changes" on a typed destination
+    }
+}
+
+/// A stand-in dewey with one plan of one row, whose status `edit` sets to "auto". A `rows` that
+/// finds the file `slow` next to it reads the plan, then takes its time to answer: the reload that
+/// is still on its way when Save is pressed.
+private let slowRowsDewey = #"""
+#!/bin/sh
+dir=$(dirname "$0")
+case "$1" in
+  rows)
+    status=$(cat "$dir/status")
+    if [ -e "$dir/slow" ]; then rm "$dir/slow"; sleep 0.7; fi
+    echo "{\"event\": \"result\", \"data\": {\"plan_id\": 3, \"created\": \"2026-11-17T21:00:00-05:00\", \"root\": \"/x\", \"dest_root\": \"/x\", \"csv\": \"/x/.dewey/plan-3.csv\", \"csv_sha256\": \"sha-$status\", \"summary\": {}, \"categories\": [], \"folder_kinds\": [], \"auto_confidence\": 0.85, \"review_confidence\": 0.5, \"rows\": [{\"row\": 1, \"src\": \"a.txt\", \"action\": \"move\", \"size\": 1, \"status\": \"$status\", \"dst\": \"Docs/a.txt\", \"category\": \"work\", \"verdict\": \"move\", \"why\": \"\", \"in_csv\": true, \"edited\": false, \"planned\": {\"status\": \"review\", \"dst\": \"Docs/a.txt\", \"category\": \"work\"}}]}}" ;;
+  edit)
+    cat > /dev/null
+    [ -e "$dir/slow-edit" ] && sleep 0.4
+    echo auto > "$dir/status"
+    echo '{"event": "result", "data": {"plan_id": 3, "csv": "/x/.dewey/plan-3.csv", "csv_sha256": "sha-auto", "changed": 1}}' ;;
+esac
+"""#
+
+@MainActor @Suite(.timeLimit(.minutes(1)))
+struct PlanReviewRaceTests {
+    private func standIn() throws -> (PlanReview, URL) {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "dewey-fake-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appending(path: "dewey")
+        try slowRowsDewey.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try "review\n".write(to: dir.appending(path: "status"), atomically: true, encoding: .utf8)
+        return (PlanReview(cli: DeweyCLI(executable: url), root: "/x"), dir)
+    }
+
+    private func until(_ condition: () -> Bool) async throws {
+        while !condition() { try await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    @Test func aSavePressedDuringAReloadShowsWhatItSaved() async throws {
+        let (review, dir) = try standIn()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        await review.load()
+        #expect(review.displayRow(1)?.status == "review")
+
+        FileManager.default.createFile(atPath: dir.appending(path: "slow").path, contents: nil)
+        let reload = Task { await review.reload() }  // coming back to the app
+        try await until { review.loading }
+        try await until { !FileManager.default.fileExists(atPath: dir.appending(path: "slow").path) }  // it has read the plan
+        review.setStatus("auto", for: [1])
+        #expect(await review.save())
+        await reload.value  // the older read answers last
+
+        // 0.2.1: the save's own read was skipped, the older rows landed: "review" again, the old
+        // checksum, and the next Save said the file had changed outside Dewey
+        #expect(review.displayRow(1)?.status == "auto")
+        #expect(review.plan?.csvSha256 == "sha-auto")
+        #expect(!review.hasChanges)
+        #expect(!review.loading)
+        #expect(review.notice == "Saved 1 change to plan-3.csv.")
+    }
+
+    @Test func aChangeMadeWhileASaveRunsIsKept() async throws {
+        let (review, dir) = try standIn()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        await review.load()
+        FileManager.default.createFile(atPath: dir.appending(path: "slow-edit").path, contents: nil)
+        review.setStatus("auto", for: [1])
+        let save = Task { await review.save() }
+        try await until { review.saving }
+        review.setStatus("skip", for: [1])  // 0.2.1: wiped when the save came back
+        #expect(await save.value)
+        #expect(review.plan?.rows.first?.status == "auto")  // what was sent is saved
+        #expect(review.pending[1] == PlanReview.Edit(status: "skip"))
+        #expect(review.displayRow(1)?.status == "skip")
+    }
+
+    @Test func aRowPutBackWhileASaveRunsIsNotLeftAsSaved() async throws {
+        let (review, dir) = try standIn()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        await review.load()
+        FileManager.default.createFile(atPath: dir.appending(path: "slow-edit").path, contents: nil)
+        review.setStatus("auto", for: [1])
+        let save = Task { await review.save() }
+        try await until { review.saving }
+        review.setStatus("review", for: [1])  // back to what the CSV said when it was read
+        #expect(review.pending.isEmpty)
+        #expect(await save.value)
+        #expect(review.pending[1] == PlanReview.Edit(status: "review"))  // the CSV says auto now
+        #expect(review.displayRow(1)?.status == "review")
+    }
+}

@@ -287,6 +287,36 @@ final class AppModel {
         alert.runModal()
     }
 
+    /// Remove from Sidebar. Unsaved Review and Settings changes go with the folder's place in the
+    /// sidebar, so a folder that has some asks first: save them, drop them, or keep the folder.
+    func askToRemoveFolder(_ path: String) {
+        guard let folder = folderModels[path], folder.hasUnsavedChanges || folder.hasUnsavedSettings else {
+            return removeFolder(path)
+        }
+        guard !folder.isRunning else { return }
+        let alert = NSAlert()
+        alert.messageText = "Save your changes to “\(folder.name)” before removing it from the sidebar?"
+        alert.informativeText = folder.unsavedSummary
+            + " Removing the folder from the sidebar drops what isn't saved. The folder and its files stay where they are."
+        alert.addButton(withTitle: "Save and Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Remove Without Saving").hasDestructiveAction = true
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            Task {
+                if await folder.saveChanges() {
+                    removeFolder(path)
+                } else {
+                    selection = .folder(path)  // not saved, so not removed: its Review or Settings says why
+                }
+            }
+        case .alertThirdButtonReturn:
+            removeFolder(path)
+        default:
+            break
+        }
+    }
+
     func removeFolder(_ path: String) {
         guard !(folderModels[path]?.isRunning ?? false) else { return }
         let index = folders.paths.firstIndex(of: path)

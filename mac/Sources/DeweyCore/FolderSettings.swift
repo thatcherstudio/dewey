@@ -139,6 +139,37 @@ public struct FolderConfig: Codable, Sendable, Equatable {
         return try e.encode(copy)
     }
 
+    /// These settings with the list ids of `old` wherever a rule or folder is the one `old` had. Every
+    /// read from dewey makes new ids; without this the rule selected in the list, or the field being
+    /// typed in, is let go of each time the settings are read again (after Save, coming back to the app).
+    public func keepingIDs(of old: FolderConfig?) -> FolderConfig {
+        guard let old else { return self }
+        var out = self
+        let rules = Self.ids(for: rules, from: old.rules, id: \.id, name: \.name)
+        for i in out.rules.indices { out.rules[i].id = rules[i] }
+        let categories = Self.ids(for: categories, from: old.categories, id: \.id) {
+            $0.key.trimmingCharacters(in: .whitespaces)
+        }
+        for i in out.categories.indices { out.categories[i].id = categories[i] }
+        return out
+    }
+
+    /// The id each of `new` gets: that of the same item in `old`, else of one with the same name, else
+    /// of the one in the same place (renamed and changed), else its own.
+    private static func ids<T: Equatable>(for new: [T], from old: [T], id: KeyPath<T, UUID>,
+                                          name: (T) -> String) -> [UUID] {
+        var free = Array(old.indices)
+        var out = [UUID?](repeating: nil, count: new.count)
+        func take(_ i: Int, where match: (Int) -> Bool) {
+            guard out[i] == nil, let at = free.firstIndex(where: match) else { return }
+            out[i] = old[free.remove(at: at)][keyPath: id]
+        }
+        for i in new.indices { take(i) { old[$0] == new[i] } }
+        for i in new.indices { take(i) { name(old[$0]) == name(new[i]) } }
+        for i in new.indices { take(i) { $0 == i } }
+        return zip(out, new).map { $0 ?? $1[keyPath: id] }
+    }
+
     /// Only what changed since `base`, for `dewey config --write` to lay over the file as it is now:
     /// a setting changed in a text editor meanwhile stays, unless it was changed here too. Rules and
     /// categories go whole (their order matters).
@@ -226,7 +257,8 @@ public final class FolderSettings {
     /// Read the settings. Changes made here are kept (unless `discarding`): a file edited elsewhere
     /// then shows when they're reverted.
     public func load(discarding: Bool = false) async {
-        guard !loading else { return }
+        // Not during a save: this read could be of the file from before it, and land after it.
+        guard !loading, !saving else { return }
         loading = true
         defer { loading = false }
         do {
@@ -241,10 +273,11 @@ public final class FolderSettings {
         file = f
         error = nil
         let changed = hasChanges
-        saved = f.config
+        let config = f.config?.keepingIDs(of: draft)
+        saved = config
         if !(keepDraft && changed) {
-            draft = f.config
-            base = f.config
+            draft = config
+            base = config
             if before?.sha256 != f.sha256 { notice = nil }  // "Saved." is about a file that's gone
         }
         if keepDraft, changed, let before, before.sha256 != f.sha256 {
@@ -253,7 +286,8 @@ public final class FolderSettings {
     }
 
     /// Write the changes to the folder's dewey.toml. If the file changed since it was read, nothing
-    /// is written: it's read again, the changes kept, to look over and save again.
+    /// is written: it's read again, the changes kept, to look over and save again. What is typed while
+    /// the save runs stays in the form, as changes since what was saved.
     @discardableResult
     public func save() async -> Bool {
         guard let draft, let file, let base, canSave else { return false }
@@ -262,10 +296,11 @@ public final class FolderSettings {
         do {
             let res = try await cli.run(["config", root, "--write", "--expect-sha", file.sha256 ?? "none"],
                                         stdin: try draft.changes(from: base), as: SettingsFile.self)
+            let config = res.config?.keepingIDs(of: self.draft)
             self.file = res
-            saved = res.config
-            self.draft = res.config
-            self.base = res.config
+            saved = config
+            self.base = config
+            if self.draft == draft { self.draft = config }
             error = nil
             notice = res.kept.map { "Saved. The dewey.toml you had is kept next to it as \(($0 as NSString).lastPathComponent)." }
                 ?? "Saved. The next Scan & Plan uses these settings."
@@ -290,10 +325,11 @@ public final class FolderSettings {
         do {
             let res = try await cli.run(["config", root, "--write", "--reset"], stdin: Data("{}".utf8),
                                         as: SettingsFile.self)
+            let config = res.config?.keepingIDs(of: draft)
             file = res
-            saved = res.config
-            draft = res.config
-            base = res.config
+            saved = config
+            draft = config
+            base = config
             error = nil
             notice = res.backup.map { "Back to the defaults. The old file is \(($0 as NSString).lastPathComponent)." }
         } catch {

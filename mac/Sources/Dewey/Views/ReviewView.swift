@@ -160,9 +160,7 @@ struct ReviewView: View {
                 Text("No plan yet").font(.title2.bold())
                 Text("Scan & Plan suggests where every file goes. Then you review it here.")
                     .foregroundStyle(.secondary)
-                Button("Scan & Plan") { folder.scanAndPlan() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!folder.exists)
+                ScanPlanButton(folder: folder)
             } else {
                 Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: error.errorDescription ?? "\(error)") {
                     Button("Try Again") { Task { await review.load() } }

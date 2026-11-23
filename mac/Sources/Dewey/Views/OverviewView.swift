@@ -5,7 +5,6 @@ import SwiftUI
 struct OverviewView: View {
     @Environment(AppModel.self) private var model
     let folder: FolderModel
-    @State private var confirmNewPlan = false
 
     var body: some View {
         ScrollView {
@@ -56,21 +55,8 @@ struct OverviewView: View {
                 HStack {
                     Button("Show in Finder") { folder.showInFinder() }
                         .controlSize(.large)
-                    Button("Scan & Plan") {
-                        if folder.hasUnsavedChanges { confirmNewPlan = true } else { folder.scanAndPlan() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .disabled(!folder.exists)
-                    .confirmationDialog("Make a new plan and drop your unsaved changes?", isPresented: $confirmNewPlan) {
-                        Button("Discard Changes and Scan", role: .destructive) {
-                            folder.review?.discardChanges()
-                            folder.scanAndPlan()
-                        }
-                        Button("Review Changes") { folder.openReview() }
-                    } message: {
-                        Text("You changed rows of the current plan in Review and didn't save. A new plan replaces it.")
-                    }
+                    ScanPlanButton(folder: folder)
+                        .controlSize(.large)
                 }
                 Text("Reads every file. Nothing moves.")
                     .font(.caption)
@@ -116,6 +102,62 @@ struct OverviewView: View {
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// Scan & Plan, wherever it is offered. It asks first about what a new plan would pass over or
+/// replace: settings changed and not saved (a plan reads dewey.toml as saved), then unsaved changes
+/// to the current plan in Review.
+struct ScanPlanButton: View {
+    let folder: FolderModel
+    @State private var confirmSettings = false
+    @State private var confirmNewPlan = false
+    @State private var saving = false
+
+    var body: some View {
+        Button("Scan & Plan") {
+            if folder.hasUnsavedSettings { confirmSettings = true } else { planOrAskAboutReview() }
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(!folder.exists || saving)
+        .confirmationDialog("Save your settings before Scan & Plan?", isPresented: $confirmSettings) {
+            Button("Save and Scan") { saveSettingsThenPlan() }
+            Button("Scan Without Saving") { planOrAskAboutReview() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Settings has changes you haven't saved. A plan uses the settings as saved, so without saving, "
+                 + "the new plan leaves them out.")
+        }
+        .confirmationDialog("Make a new plan and drop your unsaved changes?", isPresented: $confirmNewPlan) {
+            Button("Discard Changes and Scan", role: .destructive) {
+                folder.review?.discardChanges()
+                folder.scanAndPlan()
+            }
+            Button("Review Changes") { folder.openReview() }
+        } message: {
+            Text("You changed rows of the current plan in Review and didn't save. A new plan replaces it.")
+        }
+    }
+
+    private func planOrAskAboutReview() {
+        guard folder.hasUnsavedChanges else { return folder.scanAndPlan() }
+        // on the next turn: the settings question, when there was one, is still closing
+        DispatchQueue.main.async { confirmNewPlan = true }
+    }
+
+    private func saveSettingsThenPlan() {
+        guard let settings = folder.settings else { return planOrAskAboutReview() }
+        saving = true
+        Task {
+            defer { saving = false }
+            guard await settings.save() else {
+                folder.show(.settings)  // not saved: Settings says why
+                return
+            }
+            // A scan reads everything again when it ends. If Review asks first, read now.
+            if folder.hasUnsavedChanges { folder.settingsSaved() }
+            planOrAskAboutReview()
+        }
     }
 }
 

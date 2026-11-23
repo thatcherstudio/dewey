@@ -10,6 +10,7 @@ struct DeweyApp: App {
             ContentView()
                 .environment(delegate.model)
                 .frame(minWidth: 780, minHeight: 520)
+                .modifier(MainWindowOpener(delegate: delegate))
         }
         .defaultSize(width: 1240, height: 780)
         .commands {
@@ -31,9 +32,20 @@ struct DeweyApp: App {
     static let help = URL(string: "https://github.com/thatcherstudio/dewey#mac-app")!
 }
 
+/// Gives the app delegate a way to open the main window again (only a view can ask SwiftUI for one).
+private struct MainWindowOpener: ViewModifier {
+    @Environment(\.openWindow) private var openWindow
+    let delegate: AppDelegate
+
+    func body(content: Content) -> some View {
+        content.onAppear { delegate.openMainWindow = { openWindow(id: "main") } }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
+    var openMainWindow: (() -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)  // a Dock icon and menus even when run with `swift run`
@@ -41,9 +53,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await model.launch() }
     }
 
-    /// A scan or move in progress is safe to stop (it keeps what's done, moves stay undoable), but say so
-    /// before quitting.
+    /// Closing the window quits too, and by the time this asks, that window is gone. An answer that
+    /// keeps the app running (Keep Editing, Keep Running) brings it back, or to the front when it was
+    /// there all along: the changes and the run it was asked about are in it.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard confirmQuit() else {
+            DispatchQueue.main.async { [self] in  // once AppKit has heard "don't quit"
+                openMainWindow?()
+                NSApp.activate()
+            }
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
+    /// A scan or move in progress is safe to stop (it keeps what's done, moves stay undoable), but say so
+    /// before quitting. False to keep the app running.
+    private func confirmQuit() -> Bool {
         let unsaved = model.foldersWithUnsavedChanges, unsavedSettings = model.foldersWithUnsavedSettings
         if !unsaved.isEmpty || !unsavedSettings.isEmpty {
             let alert = NSAlert()
@@ -65,11 +91,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     model.selection = .folder(f.path)
                     f.tab = .settings
                 }
-                return .terminateCancel
+                return false
             }
         }
         let busy = model.busyFolders, installing = model.installer.isRunning
-        guard !busy.isEmpty || installing else { return .terminateNow }
+        guard !busy.isEmpty || installing else { return true }
         let alert = NSAlert()
         alert.messageText = busy.isEmpty ? "Stop installing Laya and quit?"
             : busy.count == 1 ? "Stop \(busy[0].activity) in \(busy[0].name) and quit?"
@@ -89,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stop.keyEquivalent = ""    // Return keeps a move going: a stray key press shouldn't leave
             keep.keyEquivalent = "\r"  // a folder half organized
         }
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func applicationWillTerminate(_ notification: Notification) {

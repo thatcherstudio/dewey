@@ -25,6 +25,8 @@ struct ApplyView: View {
     @State private var sortOrder = [KeyPathComparator(\ApplyPreview.Item.row)]
     @State private var selection = Set<Int>()
     @State private var saving = false
+    /// Why "Save Changes" here didn't save. Review shows it too, but this tab is the one in front.
+    @State private var saveProblem: String?
 
     /// What the preview depends on: a new one when any of it changes.
     private struct Key: Equatable {
@@ -92,13 +94,24 @@ struct ApplyView: View {
                              + "This preview doesn't include them.") {
                     Button("Save Changes") {
                         saving = true
+                        saveProblem = nil
                         Task {
-                            _ = await folder.review?.save()
+                            let review = folder.review
+                            if await review?.save() != true {
+                                // a failed save leaves an error; a plan file changed outside Dewey, a note
+                                saveProblem = review?.error?.errorDescription ?? review?.notice
+                                    ?? "The changes couldn't be saved."
+                            }
                             saving = false
                         }
                     }
                     .disabled(saving)
                     Button("Review") { folder.openReview() }
+                }
+                if let saveProblem {
+                    Notice(systemImage: "exclamationmark.triangle.fill", tint: .red, text: "Not saved. " + saveProblem) {
+                        Button("OK") { self.saveProblem = nil }
+                    }
                 }
             }
             if let error = apply.error {

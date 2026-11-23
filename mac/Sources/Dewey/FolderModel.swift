@@ -103,8 +103,13 @@ final class FolderModel {
         session.onEnd = { [weak self] s in
             Task {
                 await self?.refresh()
-                // a new plan: the review shows it (changes to the old one were confirmed away)
-                if case .finished = s.state, let review = self?.review { await review.load() }
+                guard let review = self?.review else { return }
+                if case .finished = s.state {
+                    await review.load()  // a new plan: the review shows it (changes to the old one were confirmed away)
+                } else {
+                    // no new plan, but settings saved for this run still change where its rows go
+                    await review.load(planId: review.plan?.planId)
+                }
             }
             if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
         }
@@ -132,6 +137,42 @@ final class FolderModel {
         guard !isRunning else { return }
         session = nil
         tab = .review
+    }
+
+    /// A tab that has something to say (a save that failed), in front of a run screen that has ended.
+    func show(_ tab: Tab) {
+        guard !isRunning else { return }
+        session = nil
+        moveRun = nil
+        undoRun = nil
+        self.tab = tab
+    }
+
+    /// What Review and Settings have unsaved, in a sentence each, for the questions that ask about them.
+    var unsavedSummary: String {
+        var text = ""
+        if let n = review?.pending.count, n > 0 {
+            text += "Review has \(ProgressText.count(n)) unsaved \(n == 1 ? "change" : "changes") to the plan."
+        }
+        if hasUnsavedSettings { text += (text.isEmpty ? "" : " ") + "Settings has unsaved changes." }
+        return text
+    }
+
+    /// Save what Review and Settings have unsaved. False when one of them couldn't be saved: its tab
+    /// is then the one showing, with the reason.
+    func saveChanges() async -> Bool {
+        if let review, review.hasChanges, await !review.save() {
+            show(.review)
+            return false
+        }
+        if let settings, settings.hasChanges {
+            guard await settings.save() else {
+                show(.settings)
+                return false
+            }
+            settingsSaved()
+        }
+        return true
     }
 
     func makeApply() {

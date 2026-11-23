@@ -77,6 +77,8 @@ public final class PlanReview {
 
     @ObservationIgnored private var all: [Row] = []
     @ObservationIgnored private var byRow: [Int: PlanRow] = [:]
+    /// How many loads have started. Only the newest one's answer is shown.
+    @ObservationIgnored private var loads = 0
 
     public init(cli: DeweyCLI, root: String) {
         self.cli = cli
@@ -103,21 +105,33 @@ public final class PlanReview {
 
     /// Read the plan's rows. Without `planId`, the latest plan; changes made here for another plan
     /// are dropped, for the same plan they are kept on top of the CSV as it is now.
-    public func load(planId: Int? = nil) async {
-        guard !loading else { return }
+    ///
+    /// A load that starts while another is running takes over: the older one read the file earlier
+    /// (before a save, say), so its answer is dropped when it comes. False for a load that was dropped.
+    @discardableResult
+    public func load(planId: Int? = nil) async -> Bool {
+        loads += 1
+        let mine = loads
         loading = true
-        defer { loading = false }
+        let answer: Result<PlanRows, DeweyError>
         do {
-            let rows = try await cli.run(["rows", root] + (planId.map { ["--plan", String($0)] } ?? []),
-                                         as: PlanRows.self)
-            show(rows)
+            answer = .success(try await cli.run(["rows", root] + (planId.map { ["--plan", String($0)] } ?? []),
+                                                as: PlanRows.self))
         } catch let e as DeweyError {
+            answer = .failure(e)
+        } catch {
+            answer = .failure(.launch(error.localizedDescription))
+        }
+        guard mine == loads else { return false }
+        loading = false
+        switch answer {
+        case .success(let rows):
+            show(rows)
+        case .failure(let e):
             error = e
             rebuild()
-        } catch {
-            self.error = .launch(error.localizedDescription)
-            rebuild()
         }
+        return true
     }
 
     /// Show freshly read rows, keeping unsaved changes when they are for the same plan.
@@ -131,10 +145,12 @@ public final class PlanReview {
         rebuild()
     }
 
-    /// Reload the same plan (Numbers may have saved it), and say so if it changed.
+    /// Reload the same plan (Numbers may have saved it), and say so if it changed. Nothing to do while
+    /// a load is already on its way.
     public func reload() async {
+        guard !loading else { return }
         let before = plan
-        await load(planId: plan?.planId)
+        guard await load(planId: plan?.planId) else { return }  // a save's own read took over
         if let before, let now = plan, now.planId == before.planId, now.csvSha256 != before.csvSha256 {
             notice = "Showing \((now.csv as NSString).lastPathComponent) as it was just saved outside Dewey."
         }
@@ -155,16 +171,18 @@ public final class PlanReview {
 
     /// Write the changes into plan-N.csv. If the file changed since it was read (saved from Numbers),
     /// nothing is written: the plan is reloaded with the changes kept, to look over and save again.
+    /// Changes made while the save runs stay, as unsaved changes on top of what was saved.
     @discardableResult
     public func save() async -> Bool {
         guard let plan, hasChanges, !saving else { return false }
         saving = true
         defer { saving = false }
-        let n = pending.count
+        let sent = pending, before = byRow
+        let n = sent.count
         do {
             let res = try await cli.run(["edit", root, "--plan", String(plan.planId), "--expect-sha", plan.csvSha256],
                                         stdin: editsJSON(), as: EditResult.self)
-            pending = [:]
+            pending = Self.unsaved(after: sent, now: pending, rows: before)
             await load(planId: plan.planId)
             notice = "Saved \(n) \(n == 1 ? "change" : "changes") to \((res.csv as NSString).lastPathComponent)."
             onSaved?()
@@ -181,6 +199,25 @@ public final class PlanReview {
             self.error = .launch(error.localizedDescription)
             return false
         }
+    }
+
+    /// What is still unsaved once `sent` is in the CSV: the changes made while that save ran (`now`
+    /// is what was pending when it ended, `rows` what the CSV said before it). A field put back to its
+    /// old value meanwhile is a change again, because the CSV now holds what was sent.
+    static func unsaved(after sent: [Int: Edit], now: [Int: Edit], rows: [Int: PlanRow]) -> [Int: Edit] {
+        var left: [Int: Edit] = [:]
+        for id in Set(sent.keys).union(now.keys) {
+            let s = sent[id] ?? Edit()
+            var e = now[id] ?? Edit()
+            guard e != s else { continue }  // saved as it was sent
+            if let r = rows[id] {
+                if s.status != nil, e.status == nil { e.status = r.status }
+                if s.category != nil, e.category == nil { e.category = r.category }
+                if s.dst != nil, e.dst == nil { e.dst = r.dst }
+            }
+            left[id] = e
+        }
+        return left  // `show` then drops every field that says what the CSV says now
     }
 
     public func discardChanges() {

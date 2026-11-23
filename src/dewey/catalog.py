@@ -103,12 +103,19 @@ def _private(db: Path) -> None:
 
 def open_db(state_dir: Path) -> sqlite3.Connection:
     make_state_dir(state_dir)
-    _private(state_dir / "catalog.db")
-    conn = sqlite3.connect(state_dir / "catalog.db")
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(SCHEMA)
+    db = state_dir / "catalog.db"
+    _private(db)
+    try:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(SCHEMA)
+    except sqlite3.OperationalError:
+        # SQLite says only "unable to open database file". When it is the system that said no
+        # (privacy settings, permissions), let that be the error: it names the file and the reason.
+        os.close(os.open(db, os.O_RDWR))
+        raise
     if "root" not in {c["name"] for c in conn.execute("PRAGMA table_info(plans)")}:  # a catalog from before 0.2.1
         conn.execute("ALTER TABLE plans ADD COLUMN root TEXT")
         conn.commit()

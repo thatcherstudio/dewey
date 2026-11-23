@@ -251,6 +251,19 @@ def _safe_rel(p: str) -> bool:
     return bool(p) and not pp.is_absolute() and ".." not in pp.parts and not p.startswith("~")
 
 
+NAME_MAX = 255  # bytes in one file or folder name: APFS, HFS+ and nearly every other disk
+
+
+def _long_name(p: str) -> str | None:
+    """The first name in a path that is longer than a disk allows, or None."""
+    return next((part for part in PurePosixPath(p).parts
+                 if len(part.encode("utf-8", "surrogatepass")) > NAME_MAX), None)
+
+
+def _too_long(name: str) -> str:
+    return f"a name in it ({name[:40]}…) is longer than {NAME_MAX} bytes, more than a disk allows"
+
+
 def _is_rel(p) -> bool:
     """A path dewey itself recorded relative to a folder: text, not absolute, never climbing out."""
     return isinstance(p, str) and bool(p) and not PurePosixPath(p).is_absolute() and ".." not in PurePosixPath(p).parts
@@ -406,9 +419,31 @@ def read_plan_csv(csv_path: Path) -> tuple[bytes, list[str], list[dict]]:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as e:
         raise DeweyExit(f"{csv_path.name} isn't UTF-8 (in Excel, save as \"CSV UTF-8\"): {e}", BAD_EDIT) from None
-    rd = csv.DictReader(io.StringIO(text, newline=""))
+    rd = csv.DictReader(io.StringIO(text, newline=""), delimiter=_delimiter(text, csv_path))
     rows = list(rd)
     return data, list(rd.fieldnames or []), rows
+
+
+def _delimiter(text: str, csv_path: Path) -> str:
+    """What stands between the cells of a plan CSV: the one that gives its first line a `row` column.
+
+    dewey writes commas. Excel and Numbers save `;` where the decimal comma is used, and some tools
+    save tabs. Read as commas, such a file has one column and no `row`, every line counted as
+    deleted, and a deleted line means skip: 0.2.1 answered "0 files to move" and said nothing. A
+    first line with no `row` column any way it is cut is an error for the same reason. A file with
+    nothing in it stays what it was: every line deleted."""
+    first = text.lstrip("\r\n").split("\n", 1)[0].rstrip("\r")
+    if not first.strip():
+        return ","
+    for d in (",", ";", "\t"):
+        try:
+            if "row" in [c.strip() for c in next(csv.reader([first], delimiter=d), [])]:
+                return d
+        except csv.Error:
+            continue
+    raise DeweyExit(f"{csv_path.name} has no `row` column in its first line, so dewey can't tell which line "
+                    f"is which row. Nothing moved. Put the first line back ({','.join(CSV_FIELDS)}), "
+                    "or run `dewey plan` again.", BAD_EDIT)
 
 
 def edits_by_row(rows: list[dict]) -> dict[int, dict]:
@@ -473,8 +508,18 @@ def resolve_row(r, e: dict | None, cats: dict, homes: dict, fence: Fence) -> Res
             dst = f"{home.strip('/')}/{name}"
     # "Data/Exports/" or an existing folder means "into this folder", not "rename it to Exports".
     # Only for a dst the person typed: the planned dst never ends in "/" and must not be second-guessed.
-    if dst != r["dst"] and (dst.endswith("/") or (dest_root / dst).is_dir()):
-        dst = f"{dst.rstrip('/')}/{name}"
+    if dst != r["dst"]:
+        # A dst the disk can't even look at (a name too long, a folder on the way that can't be
+        # entered) is this row's problem. 0.2.1 let the error out, so one such cell failed `rows`
+        # and `apply` for the whole plan, and Review couldn't open the plan to fix it.
+        if _long_name(dst):
+            return Resolution(status, dst, category, "refused", f"dst can't be used: {_too_long(_long_name(dst))}")
+        try:
+            into = dst.endswith("/") or (dest_root / dst).is_dir()
+        except OSError as ex:
+            return Resolution(status, dst, category, "refused", f"dst {dst!r} can't be used: {ex.strerror or ex}")
+        if into:
+            dst = f"{dst.rstrip('/')}/{name}"
     if not _safe_rel(dst):
         return Resolution(status, dst, category, "refused",
                           f"dst {dst!r} must be a relative path inside the destination root")
@@ -577,7 +622,7 @@ def plan_summary(conn, root: Path, state_dir: Path, plan) -> dict:
     """`summary_now` for `dewey status`. A plan whose CSV can't be read keeps the counts it was made with."""
     try:
         _, _, csv_rows = read_plan_csv(plan_files(state_dir, plan["id"])[0])
-    except (DeweyExit, csv.Error):
+    except (DeweyExit, csv.Error, OSError):
         return json.loads(plan["summary"] or "{}")
     rows = conn.execute("SELECT row, size, action FROM plan_rows WHERE plan_id=?", (plan["id"],))
     return summary_now(rows, edits_by_row(csv_rows), moved_rows(conn, root, state_dir, plan["id"]))
@@ -1335,6 +1380,8 @@ def _check_edits(edits, db_rows: dict, pid: int) -> list[dict]:
                 raise DeweyExit(f"row {row}: {k} must be a string", BAD_EDIT)
         if "status" in ed and ed["status"].strip().lower() not in ("auto", "review", "skip"):
             raise DeweyExit(f"row {row}: status {ed['status']!r} isn't auto/review/skip", BAD_EDIT)
+        if _long_name(ed.get("dst", "")):
+            raise DeweyExit(f"row {row}: dst can't be saved: {_too_long(_long_name(ed['dst']))}", BAD_EDIT)
     return edits
 
 

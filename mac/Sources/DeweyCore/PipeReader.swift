@@ -61,6 +61,53 @@ enum PipeReader {
     }
 }
 
+/// What a child has written so far, without waiting for the pipe to close.
+///
+/// `lines` and `tail` read to the end of the pipe, and the end comes only when every process that
+/// holds its other side has exited. A shell profile that leaves something running (`ssh-agent`,
+/// anything with `&`) hands that process the pipe, so the end doesn't come while it lives. This one
+/// reads on a queue of its own until `finish()`, which takes what is in the pipe by then and stops.
+final class PipeCollector: @unchecked Sendable {  // `data` is only touched on `queue`
+    private let handle: FileHandle
+    private let keepLast: Int
+    private let queue = DispatchQueue(label: "dewey.pipe-collector")
+    private let source: DispatchSourceRead
+    private var data = Data()
+
+    init(_ handle: FileHandle, keepLast: Int) {
+        self.handle = handle
+        self.keepLast = keepLast
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)  // a read takes what is there and returns
+        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.drain() }
+        source.setCancelHandler { [handle] in _ = handle }  // the descriptor stays open until the source lets go
+        source.resume()
+    }
+
+    deinit { source.cancel() }
+
+    private func drain() {
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let n = read(handle.fileDescriptor, &buffer, buffer.count)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { return }  // 0: the pipe closed. -1: nothing more in it for now.
+            data.append(contentsOf: buffer[0..<n])
+            if data.count > 2 * keepLast { data = Data(data.suffix(keepLast)) }
+        }
+    }
+
+    /// The last `keepLast` bytes written up to now. Nothing is read after this.
+    func finish() -> String {
+        queue.sync {
+            drain()
+            source.cancel()
+            return String(decoding: data.suffix(keepLast), as: UTF8.self)
+        }
+    }
+}
+
 /// Splits chunks into lines. Only touched from one handle's readability queue, which is serial.
 final class LineBuffer: @unchecked Sendable {
     private var pending = Data()

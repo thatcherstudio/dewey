@@ -102,6 +102,22 @@ struct ScanPlanSessionTests {
         #expect(s.progress.log.filter { $0 == "Scan 1: 3 files" }.count == 1)  // scanned once
     }
 
+    /// Laya isn't installed and the person chose to go on: no model is asked or waited for, from the start.
+    @Test func aRunCanBeRulesOnlyFromTheStart() async throws {
+        let s = ScanPlanSession(cli: try fakeCLI(["FAKE_DECIDER": "down"]), root: "/x", modelLoading: { true })
+        s.start(rulesOnly: true)
+        await s.wait()
+        #expect(s.state == .finished)
+        #expect(s.rulesOnly && s.scan?.files == 3)
+        #expect(s.plan?.planId == 2)  // the fake answers --backend none with plan 2
+        #expect(s.progress.phase("decide")?.state == .skipped)
+
+        s.restart(rulesOnly: true)  // Scan Again, with the same answer
+        await s.wait()
+        #expect(s.state == .finished && s.rulesOnly)
+        #expect(s.plan?.planId == 2)
+    }
+
     @Test func aServerOnAnotherMachineIsAskedAboutBeforePlanning() async throws {
         let s = ScanPlanSession(cli: try fakeCLI(["FAKE_DECIDER": "elsewhere"]), root: "/x")
         s.start()

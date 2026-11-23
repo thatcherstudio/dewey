@@ -65,6 +65,51 @@ struct ToolLocatorTests {
         #expect(await locator.locate(.dewey, preferred: venv.path) == venv, "a chosen path still wins")
     }
 
+    // MARK: the login shell (0.2.1 had no test of it: every other test passes useLoginShell: false)
+
+    /// A stand-in login shell: a script that gets the `-l -c "command -v NAME"` a real one would.
+    private func shell(_ body: String) throws -> String {
+        let url = try tempDir().appending(path: "shell")
+        try makeFile(url, executable: true, text: "#!/bin/sh\n" + body + "\n")
+        return url.path
+    }
+
+    private func seconds(_ work: () async -> URL?) async -> (URL?, Double) {
+        let began = Date()
+        let found = await work()
+        return (found, Date().timeIntervalSince(began))
+    }
+
+    /// A profile that leaves a process running hands it the shell's output pipe. The answer is there
+    /// as soon as the shell exits; 0.2.1 waited for that process too (here: 12 s), and for good when
+    /// it was one that stays (`ssh-agent`), with the window on "Checking setup…".
+    @Test(.timeLimit(.minutes(1))) func theShellsAnswerDoesntWaitForWhatItsProfileLeftRunning() async throws {
+        let locator = ToolLocator(home: try tempDir(), systemDirs: [])
+        let profile = try shell("sleep 12 &\necho /bin/ls")
+        let (found, took) = await seconds { await locator.loginShellLookup("ls", shell: profile) }
+        #expect(found == URL(fileURLWithPath: "/bin/ls"))
+        #expect(took < 5, "took \(took) s")
+    }
+
+    @Test(.timeLimit(.minutes(1))) func aShellThatDoesntAnswerIsEndedAtTheLimit() async throws {
+        let locator = ToolLocator(home: try tempDir(), systemDirs: [])
+        let stuck = try shell("sleep 12")  // the limit ends the shell; its `sleep` lives on, holding the pipe
+        let (found, took) = await seconds { await locator.loginShellLookup("ls", shell: stuck, limit: 0.5) }
+        #expect(found == nil)
+        #expect(took < 5, "took \(took) s")
+    }
+
+    @Test(.timeLimit(.minutes(1))) func aProfileThatPrintsALotStillGetsItsAnswerRead() async throws {
+        let locator = ToolLocator(home: try tempDir(), systemDirs: [])
+        let chatty = try shell("""
+            i=0; while [ $i -lt 3000 ]; do echo "welcome banner line $i, padding padding padding padding"; i=$((i+1)); done
+            echo /bin/ls
+            """)  // about 170 KB: more than a pipe holds, so it has to be read while the shell runs
+        #expect(await locator.loginShellLookup("ls", shell: chatty) == URL(fileURLWithPath: "/bin/ls"))
+        #expect(await locator.loginShellLookup("ls", shell: try shell("echo not/a/path; echo /nope/ls")) == nil)
+        #expect(await locator.loginShellLookup("ls", shell: "/nope/no-such-shell") == nil)
+    }
+
     @Test func installCommandsQuoteTheRepoPath() {
         let cmd = SetupCommands.installDewey(repo: URL(fileURLWithPath: "/Users/x/My Projects/dewey"))
         #expect(cmd.contains("-e '/Users/x/My Projects/dewey[all]'"))
@@ -164,6 +209,94 @@ struct LayaControllerTests {
         await laya.stopAndWait()
         #expect(!laya.isRunning && laya.executable == nil)
         #expect(laya.status == .stopped)
+        #expect(await LayaController.probe(laya.baseURL) == .refused)
+    }
+
+    // MARK: where Laya is (0.2.1: a server started here for an address that isn't here, with no end)
+
+    @Test func anAddressOnThisMacWithNoPortMeansLayasOwnPort() throws {
+        for (given, used) in [("http://localhost", "http://localhost:8000"), ("http://127.0.0.1", "http://127.0.0.1:8000"),
+                              ("http://[::1]", "http://[::1]:8000"), ("http://127.0.0.1:8123", "http://127.0.0.1:8123"),
+                              ("http://other-mac.local", "http://other-mac.local"),  // not this Mac: as written
+                              ("https://laya.example.com/team", "https://laya.example.com/team")] {
+            let laya = LayaController(baseURL: try #require(URL(string: given)))
+            #expect(laya.baseURL.absoluteString == used, "\(given)")
+            laya.baseURL = try #require(URL(string: "http://127.0.0.1:9999"))
+            laya.baseURL = try #require(URL(string: given))  // set later (Dewey > Settings…): the same
+            #expect(laya.baseURL.absoluteString == used, "\(given), set")
+        }
+        let local = LayaController(baseURL: try #require(URL(string: "http://localhost")))
+        #expect(local.port == 8000 && local.isLocal)
+        #expect(!LayaController(baseURL: try #require(URL(string: "http://192.168.1.20:8000"))).isLocal)
+        // the server is started on 8000 and looked for on 8000, and a folder that says 8000 asks that one
+        #expect(ModelSource(backend: "systemone", url: "http://127.0.0.1:8000", appLaya: local.baseURL) == .appLaya)
+    }
+
+    @Test func aLayaOnAnotherMachineIsWatchedAndNeverStartedHere() async throws {
+        let exe = try tempDir().appending(path: "laya-serve")
+        try makeFile(exe, executable: true, text: "#!/bin/sh\ntouch \"$0.ran\"\nexec sleep 30\n")
+        // `.invalid` never resolves: to the app it is a machine that is switched off
+        let laya = LayaController(baseURL: try #require(URL(string: "http://dewey-laya-test.invalid:8000")))
+        await laya.refresh()
+        guard case .failed(let why) = laya.status else {
+            Issue.record("a Laya elsewhere that doesn't answer isn't \"stopped\", with a Start button: \(laya.status)")
+            return
+        }
+        #expect(why.contains("dewey-laya-test.invalid:8000") && why.contains("isn't this Mac"))
+
+        await laya.start(executable: exe)
+        #expect(!laya.isRunning && !laya.ownsServer)
+        #expect(laya.status == .failed(why))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(!FileManager.default.fileExists(atPath: exe.path + ".ran"), "nothing was started on this Mac")
+    }
+
+    @Test func aServerThatNeverAnswersStopsBeingStartingAfterTheLimit() async throws {
+        let exe = try tempDir().appending(path: "laya-serve")
+        try makeFile(exe, executable: true, text: "#!/bin/sh\nexec sleep 30\n")  // runs, and never listens
+        let base = try #require(URL(string: "http://127.0.0.1:\(Int.random(in: 19_001...19_900))"))
+        let laya = LayaController(baseURL: base, startupLimit: 1.5)
+        await laya.start(executable: exe)
+        guard case .starting = laya.status else {
+            Issue.record("should be starting: \(laya.status)")
+            return
+        }
+        try await waitFor(seconds: 8) { if case .failed = laya.status { true } else { false } }
+        #expect(laya.status == .failed(LayaController.stillLoading(after: 1.5, at: base)))
+        #expect(laya.isRunning, "it is left running: a first start that downloads the model takes longer")
+        #expect(LayaController.stillLoading(after: 600, at: base).contains("running for 10 minutes"))
+        await laya.stopAndWait()
+        #expect(laya.status == .stopped && !laya.isRunning)
+    }
+
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
+    func aServerThatAnswersAfterTheLimitStillTurnsReady() async throws {
+        let exe = try tempDir().appending(path: "laya-serve")
+        try makeFile(exe, executable: true, text: fakeLaya.replacingOccurrences(of: "#!/bin/sh\n", with: "#!/bin/sh\nsleep 3\n"))
+        let laya = LayaController(baseURL: try #require(URL(string: "http://127.0.0.1:\(Int.random(in: 19_901...19_999))")),
+                                  startupLimit: 1)
+        await laya.start(executable: exe)
+        try await waitFor(seconds: 8) { if case .failed = laya.status { true } else { false } }
+        try await waitFor(seconds: 12) { if case .ready = laya.status { true } else { false } }
+        #expect(laya.status == .ready(.init(loaded: ["english"], device: "cpu")))
+        await laya.stopAndWait()
+    }
+
+    /// Scan & Plan starts Laya, and so do the launch and the Start button: two of them can meet.
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"), "needs /usr/bin/python3"))
+    func twoStartsAtOnceStartOneServer() async throws {
+        let exe = try tempDir().appending(path: "laya-serve")
+        try makeFile(exe, executable: true,
+                     text: fakeLaya.replacingOccurrences(of: "#!/bin/sh\n", with: "#!/bin/sh\necho started >> \"$0.starts\"\n"))
+        let laya = LayaController(baseURL: try #require(URL(string: "http://127.0.0.1:\(Int.random(in: 9_000...9_900))")))
+        async let first: Void = laya.start(executable: exe)
+        async let second: Void = laya.start(executable: exe)
+        _ = await (first, second)
+        #expect(laya.isRunning && laya.ownsServer)
+        try await waitFor(seconds: 10) { if case .ready = laya.status { true } else { false } }
+        let starts = try String(contentsOfFile: exe.path + ".starts", encoding: .utf8)
+        #expect(starts == "started\n")
+        await laya.stopAndWait()
         #expect(await LayaController.probe(laya.baseURL) == .refused)
     }
 

@@ -47,7 +47,7 @@ final class AppModel {
 
     var dewey: Check = .checking
     var layaServe: Check = .checking
-    /// False until the first check finishes (the window shows a spinner, not a flash of setup).
+    /// False until dewey has been checked once (the window shows a spinner, not a flash of setup).
     var checkedOnce = false
     /// dewey passed its last finished check, so "Check Again" keeps the main window up while it runs.
     var lastDeweyOK = false
@@ -158,6 +158,10 @@ final class AppModel {
                                + "~/.venvs/dewey, ~/.local/bin, Homebrew, or your shell's PATH."
                              : "The dewey path in Settings (\(deweyPref)) isn't an executable file.")
         }
+        // The window waits for dewey and no longer: Laya and uv, when they aren't in the usual places,
+        // are looked for in the login shell, and a slow shell profile takes its whole 5 s over that.
+        lastDeweyOK = dewey.isOK
+        checkedOnce = true
 
         layaServeURL = await foundLaya
         uvURL = await foundUV
@@ -172,8 +176,6 @@ final class AppModel {
                                  : "The laya-serve path in Settings (\(layaPref)) isn't an executable file.")
         }
         await laya.refresh()
-        lastDeweyOK = dewey.isOK
-        checkedOnce = true
     }
 
     /// Install Laya, then start it.

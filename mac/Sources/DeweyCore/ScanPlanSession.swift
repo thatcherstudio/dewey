@@ -71,9 +71,11 @@ public final class ScanPlanSession {
         return first.prefix(1).uppercased() + first.dropFirst()  // the rest is how to allow it in Terminal
     }
 
-    public func start() {
+    /// `rulesOnly`: plan with `--backend none` from the start (Laya isn't installed, and the person
+    /// chose to go on without it).
+    public func start(rulesOnly: Bool = false) {
         guard task == nil else { return }
-        launch(scanFirst: true, rulesOnly: false)
+        launch(scanFirst: true, rulesOnly: rulesOnly)
     }
 
     /// Plan again without scanning, after a failed or stopped plan. `allowRemote` is the person's yes
@@ -84,12 +86,12 @@ public final class ScanPlanSession {
     }
 
     /// Scan and plan again from the start.
-    public func restart() {
+    public func restart(rulesOnly: Bool = false) {
         guard !isActive else { return }
         progress = RunProgress(phases: Self.scanPhases + Self.planPhases)
         scan = nil
         plan = nil
-        launch(scanFirst: true, rulesOnly: false)
+        launch(scanFirst: true, rulesOnly: rulesOnly)
     }
 
     /// Cancel was pressed and dewey hasn't stopped yet. It stops after the item in hand; one that is

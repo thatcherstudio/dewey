@@ -17,6 +17,7 @@ DECIDER = "decider"
 REMOTE_DECIDER = "remote_decider"  # the folder's own settings name a server elsewhere; not allowed yet
 BAD_EDIT = "bad_edit"
 STALE = "stale"
+NO_ACCESS = "no_access"  # the system turned dewey away from a file or folder (privacy settings, permissions)
 
 
 class DeweyExit(SystemExit):

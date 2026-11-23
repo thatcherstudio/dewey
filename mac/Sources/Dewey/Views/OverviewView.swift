@@ -18,6 +18,7 @@ struct OverviewView: View {
                         if folder.statusErrorCode == "config" {
                             Button("Open Settings") { folder.tab = .settings }
                         }
+                        if folder.statusErrorCode == "no_access" { PrivacySettingsButton() }
                         Button("Try Again") { Task { await folder.refresh() } }
                     }
                 }
@@ -105,21 +106,59 @@ struct OverviewView: View {
     }
 }
 
-/// Scan & Plan, wherever it is offered. It asks first about what a new plan would pass over or
-/// replace: settings changed and not saved (a plan reads dewey.toml as saved), then unsaved changes
-/// to the current plan in Review.
+/// dewey's `no_access`: macOS asks about a folder once, so the way back from "Don't Allow" is here.
+struct PrivacySettingsButton: View {
+    /// System Settings > Privacy & Security > Files and Folders.
+    static let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!
+
+    var body: some View {
+        Button("Open Privacy Settings") { NSWorkspace.shared.open(Self.pane) }
+            .help("System Settings > Privacy & Security > Files and Folders: turn this folder on for Dewey.")
+    }
+}
+
+/// "Laya isn't installed", asked before a scan whose plan would ask Laya. (0.2.1 scanned everything
+/// first and then said the model "didn't answer… Start it and try again", with nothing to start.)
+struct LayaQuestion: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Binding var isPresented: Bool
+    let planWithRulesOnly: () -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog("Plan without Laya?", isPresented: $isPresented) {
+            Button("Install Laya…") { model.selection = .setup }
+            Button("Plan with Rules Only") { planWithRulesOnly() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This folder's plans ask Laya, the decision model, where each file belongs, and Laya isn't "
+                 + "installed on this Mac. Install it from Setup (about 1.7 GB), or plan with your rules only: "
+                 + "duplicates and files a rule covers are planned, the rest stay where they are.")
+        }
+    }
+}
+
+/// Scan & Plan, wherever it is offered. It asks first about what the plan can't have or would pass
+/// over or replace: Laya, when the plan would ask it and it isn't installed; settings changed and
+/// not saved (a plan reads dewey.toml as saved); then unsaved changes to the current plan in Review.
+/// In that order, so that nothing is dropped before the last Cancel.
 struct ScanPlanButton: View {
     let folder: FolderModel
+    @State private var askAboutLaya = false
     @State private var confirmSettings = false
     @State private var confirmNewPlan = false
     @State private var saving = false
+    /// The answer to the Laya question, for the questions after it.
+    @State private var rulesOnly = false
 
     var body: some View {
         Button("Scan & Plan") {
-            if folder.hasUnsavedSettings { confirmSettings = true } else { planOrAskAboutReview() }
+            if folder.modelStart == .askToInstall { askAboutLaya = true } else { begin(rulesOnly: false) }
         }
         .buttonStyle(.borderedProminent)
         .disabled(!folder.exists || saving)
+        .modifier(LayaQuestion(isPresented: $askAboutLaya) {
+            DispatchQueue.main.async { begin(rulesOnly: true) }  // on the next turn: this question is still closing
+        })
         .confirmationDialog("Save your settings before Scan & Plan?", isPresented: $confirmSettings) {
             Button("Save and Scan") { saveSettingsThenPlan() }
             Button("Scan Without Saving") { planOrAskAboutReview() }
@@ -131,7 +170,7 @@ struct ScanPlanButton: View {
         .confirmationDialog("Make a new plan and drop your unsaved changes?", isPresented: $confirmNewPlan) {
             Button("Discard Changes and Scan", role: .destructive) {
                 folder.review?.discardChanges()
-                folder.scanAndPlan()
+                folder.scanAndPlan(rulesOnly: rulesOnly)
             }
             Button("Review Changes") { folder.openReview() }
         } message: {
@@ -139,8 +178,14 @@ struct ScanPlanButton: View {
         }
     }
 
-    private func planOrAskAboutReview() {
-        guard folder.hasUnsavedChanges else { return folder.scanAndPlan() }
+    private func begin(rulesOnly: Bool) {
+        self.rulesOnly = rulesOnly
+        if folder.hasUnsavedSettings { confirmSettings = true } else { planOrAskAboutReview(rulesOnly: rulesOnly) }
+    }
+
+    /// `rulesOnly` is passed by a caller that has just set it; the dialogs' buttons read the state.
+    private func planOrAskAboutReview(rulesOnly: Bool? = nil) {
+        guard folder.hasUnsavedChanges else { return folder.scanAndPlan(rulesOnly: rulesOnly ?? self.rulesOnly) }
         // on the next turn: the settings question, when there was one, is still closing
         DispatchQueue.main.async { confirmNewPlan = true }
     }

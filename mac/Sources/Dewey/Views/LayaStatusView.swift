@@ -58,7 +58,9 @@ struct LayaPanel: View {
             case .unknown:
                 Text("Checking…").foregroundStyle(.secondary)
             case .stopped:
-                Text("Not running. Without it, plans use your rules and duplicates only.")
+                Text(model.layaServeURL == nil
+                     ? "Not running. Without it, plans use your rules and duplicates only."
+                     : "Not running. Scan & Plan starts it for a folder whose plans ask it.")
                     .foregroundStyle(.secondary)
             case .starting(let since):
                 TimelineView(.periodic(from: since, by: 1)) { ctx in
@@ -83,6 +85,8 @@ struct LayaPanel: View {
                     Button("Stop") { laya.stop() }
                 } else if case .ready = laya.status {
                     EmptyView()
+                } else if !laya.isLocal {  // a Laya on another machine: watched from here, started there
+                    Button("Check Again") { Task { await laya.refresh() } }
                 } else {
                     Button("Start") { Task { await model.startLaya() } }
                         .disabled(model.layaServeURL == nil)

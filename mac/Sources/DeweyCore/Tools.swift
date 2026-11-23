@@ -61,10 +61,15 @@ public struct ToolLocator: Sendable {
         return useLoginShell ? await loginShellLookup(tool.rawValue) : nil
     }
 
-    /// `command -v NAME` in the person's login shell, with a 5 s limit (a slow shell profile must
-    /// not hang setup).
-    func loginShellLookup(_ name: String) async -> URL? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
+    /// `command -v NAME` in the person's login shell. The shell gets `limit` seconds and is then ended:
+    /// a slow shell profile must not hang setup.
+    ///
+    /// Only the shell is waited for, never the end of what it prints. A profile that leaves a process
+    /// running (`ssh-agent`, anything with `&`) hands it the shell's output pipe, and that pipe closes
+    /// only when the process exits. 0.2.1 read to the end of the pipe, so it waited for that process
+    /// too, after the 5 s as well, with the window on "Checking setup…" all the while.
+    func loginShellLookup(_ name: String, shell: String? = nil, limit: TimeInterval = 5) async -> URL? {
+        let shell = shell ?? ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: shell)
         p.arguments = ["-l", "-c", "command -v \(name)"]
@@ -75,14 +80,15 @@ public struct ToolLocator: Sendable {
         let (done, cont) = AsyncStream<Void>.makeStream()
         p.terminationHandler = { _ in cont.finish() }
         guard (try? p.run()) != nil else { return nil }
+        let output = PipeCollector(out.fileHandleForReading, keepLast: 65_536)
         let pid = p.processIdentifier
         let timeout = Task {
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(limit))
             if !Task.isCancelled { kill(pid, SIGKILL) }
         }
-        let text = await PipeReader.tail(out.fileHandleForReading, keepLast: 65_536).value
-        for await _ in done {}
+        for await _ in done {}  // the shell has exited, or the limit ended it
         timeout.cancel()
+        let text = output.finish()
         let path = text.split(separator: "\n").last(where: { $0.hasPrefix("/") }).map(String.init)
         return path.map { URL(fileURLWithPath: $0) }.flatMap { Self.isExecutable($0) ? $0 : nil }
     }

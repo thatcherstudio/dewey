@@ -99,6 +99,8 @@ struct CLITests {
         await #expect(throws: DeweyError.failed(code: "nothing_to_undo", message: "nothing to undo")) {
             try await makeFake().run(["fail"], as: Value.self)
         }
+        #expect(DeweyError.failed(code: "no_access", message: "macOS didn't let dewey open /x").code == "no_access")
+        #expect(DeweyError.crashed(status: 3, stderr: "").code == nil)
     }
 
     @Test func exitWithoutClosingEventIsACrashWithStderr() async throws {

@@ -29,7 +29,7 @@ from contextlib import closing
 from pathlib import Path
 
 from . import __version__, catalog, config, decide, extract, mover, planner, progress, remote
-from .errors import BAD_EDIT, CONFIG, NO_CATALOG, NOT_A_FOLDER, REMOTE_DECIDER, DeweyExit
+from .errors import BAD_EDIT, CONFIG, NO_ACCESS, NO_CATALOG, NOT_A_FOLDER, REMOTE_DECIDER, DeweyExit
 from .progress import emit, human_bytes, say
 
 PROTOCOL = 1  # bump when an event or result shape changes in a way the app must know about
@@ -392,6 +392,18 @@ def _leave_now(code) -> None:
     os._exit(code or 0)
 
 
+def _no_access(e: PermissionError) -> str:
+    """The system turned dewey away from a file or folder. On a Mac that is most often the privacy
+    question ("… would like to access files in your Downloads folder") answered with Don't Allow:
+    macOS asks once, so the message says where to change the answer. 0.2.1 showed the app
+    `PermissionError: [Errno 13] …` and a Try Again that could only fail the same way."""
+    what = f"open {e.filename}" if e.filename else "do that"
+    return (f"macOS didn't let dewey {what} ({e.strerror or e}).\n"
+            "If you chose Don't Allow when macOS asked about this folder, allow it in System Settings > "
+            "Privacy & Security > Files and Folders (for Dewey, or for your terminal app), then try again. "
+            "If not, look at the folder's permissions: in Finder, Get Info > Sharing & Permissions.")
+
+
 def main(argv=None):
     """The `dewey` command. With no argv it is the program itself (not a test calling main([...])),
     so an exit that leaves worker threads behind doesn't wait for them."""
@@ -421,6 +433,8 @@ def _main(argv=None):
             else:
                 say("\ninterrupted. Finished work is saved; if files were moving, `dewey undo ROOT` puts back the ones that moved.")
             raise SystemExit(130)
+        except PermissionError as e:  # one file a move can't touch is that row's problem; this is the folder's
+            raise DeweyExit(_no_access(e), NO_ACCESS) from None
         if as_json:
             emit("result", data=data if data is not None else {})
     except SystemExit as e:

@@ -11,6 +11,12 @@ public enum DeweyError: Error, Equatable, LocalizedError {
     case launch(String)
     case undecodable(String)
 
+    /// dewey's own code for what went wrong, when it said (`no_access`, `config`, …).
+    public var code: String? {
+        if case .failed(let code, _) = self { return code }
+        return nil
+    }
+
     public var errorDescription: String? {
         switch self {
         case .failed(_, let message): message

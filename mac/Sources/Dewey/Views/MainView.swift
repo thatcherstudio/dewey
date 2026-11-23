@@ -73,7 +73,7 @@ struct Sidebar: View {
                 HStack {
                     Label("Setup", systemImage: "wrench.and.screwdriver")
                     Spacer()
-                    if !model.layaServe.isOK {
+                    if case .problem = model.layaServe {  // not while it is still being looked for
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                             .help("laya-serve isn't installed: plans use rules and duplicates only.")

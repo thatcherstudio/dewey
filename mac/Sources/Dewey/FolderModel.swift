@@ -35,6 +35,8 @@ final class FolderModel {
     /// The Settings tab: this folder's dewey.toml, made the first time it opens.
     var settings: FolderSettings?
     @ObservationIgnored private weak var app: AppModel?
+    /// Laya was asked to start for a plan here and hasn't said yet whether it did.
+    @ObservationIgnored private var startingLaya = false
 
     init(path: String, app: AppModel) {
         self.path = path
@@ -70,6 +72,15 @@ final class FolderModel {
     /// Plans here wait for the app's Laya and can start it (also assumed until status has answered).
     var usesAppLaya: Bool { modelSource?.isAppLaya ?? true }
 
+    /// What Scan & Plan does about the model before it scans: start Laya, or ask about installing it.
+    var modelStart: ModelStart {
+        guard let app else { return .nothing }
+        var installed: Bool? = app.layaServeURL != nil ? true : nil
+        if installed == nil, case .problem = app.layaServe { installed = false }  // looked for, and not there
+        return ModelStart(source: modelSource, laya: app.laya.status, layaRunning: app.laya.isRunning,
+                          layaIsLocal: app.laya.isLocal, installed: installed)
+    }
+
     /// Still there (an external disk may be unplugged, a folder renamed in Finder).
     var exists: Bool {
         var isDir: ObjCBool = false
@@ -88,15 +99,19 @@ final class FolderModel {
             statusErrorCode = nil
         } catch {
             statusError = error.localizedDescription
-            if case .failed(let code, _) = error as? DeweyError { statusErrorCode = code } else { statusErrorCode = nil }
+            statusErrorCode = (error as? DeweyError)?.code
         }
     }
 
-    func scanAndPlan() {
+    /// Scan, then plan. A plan that asks the app's Laya starts it now, when it is installed and not
+    /// running, so the model loads while the scan reads the files. When Laya isn't installed, whoever
+    /// calls this asks first (`modelStart`) and passes `rulesOnly` for a plan without it.
+    func scanAndPlan(rulesOnly: Bool = false) {
         guard let app, let cli = app.cli, !isRunning else { return }
         let laya = app.laya
         let session = ScanPlanSession(cli: cli, root: path, modelLoading: { [weak self] in
             guard self?.usesAppLaya ?? true else { return false }  // another server: nothing here to wait for
+            if self?.startingLaya ?? false { return true }
             if case .starting = laya.status { return true }
             return false
         })
@@ -114,7 +129,24 @@ final class FolderModel {
             if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
         }
         self.session = session
-        session.start()
+        if !rulesOnly { startLayaForPlan() }
+        session.start(rulesOnly: rulesOnly)
+    }
+
+    /// Scan Again, on a run screen that has ended.
+    func scanAgain(rulesOnly: Bool = false) {
+        guard let session, !isRunning else { return }
+        if !rulesOnly { startLayaForPlan() }
+        session.restart(rulesOnly: rulesOnly)
+    }
+
+    private func startLayaForPlan() {
+        guard let app, modelStart == .startLaya, !startingLaya else { return }
+        startingLaya = true  // from this moment the plan waits, also while Laya is still being looked at
+        Task {
+            await app.startLaya()
+            startingLaya = false
+        }
     }
 
     /// The plan failed because the model wasn't running: start Laya, then plan again (it waits for

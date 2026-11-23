@@ -6,6 +6,7 @@ struct RunView: View {
     @Environment(AppModel.self) private var model
     let folder: FolderModel
     let session: ScanPlanSession
+    @State private var askAboutLaya = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -89,13 +90,27 @@ struct RunView: View {
         }
     }
 
+    /// What the notice says when the scan is done and no model answered. Built a sentence at a time: one
+    /// long joined expression is more than Xcode 26's compiler will type-check.
+    private var noModelText: String {
+        if folder.modelStart == .askToInstall {
+            var text = "The scan is done, but Laya, the decision model, isn't installed on this Mac, so no plan was made."
+            text += " Install it from Setup and try again, or plan with your rules only."
+            return text
+        }
+        var text = "The scan is done, but the decision model didn't answer, so no plan was made."
+        text += " Start it and try again, or plan with your rules only."
+        return text
+    }
+
     @ViewBuilder
     private func failure(_ step: ScanPlanSession.Step, _ error: DeweyError) -> some View {
         let layaCanStart: Bool = {
-            guard folder.usesAppLaya, model.layaServeURL != nil, !model.laya.isRunning else { return false }
+            guard folder.usesAppLaya, model.layaServeURL != nil, model.laya.isLocal, !model.laya.isRunning else { return false }
             if case .ready = model.laya.status { return false }
             return true
         }()
+        let layaMissing = folder.modelStart == .askToInstall
         // The folder's own settings name another server: starting the app's Laya wouldn't help.
         let elsewhere: String? = switch folder.modelSource {
         case .otherLaya(let place), .chat(let place): place
@@ -124,10 +139,14 @@ struct RunView: View {
                 }
             } else if session.needsModel {
                 Notice(systemImage: "brain", tint: .orange,
-                       text: "The scan is done, but the decision model didn't answer, so no plan was made. "
-                             + "Start it and try again, or plan with your rules only.")
+                       text: noModelText)
                 HStack {
-                    if layaCanStart {
+                    if layaMissing {
+                        Button("Install Laya…") { model.selection = .setup }
+                            .buttonStyle(.borderedProminent)
+                            .help("Opens Setup. This scan is kept: come back here and try again.")
+                        Button("Try Again") { session.retryPlan(rulesOnly: false) }
+                    } else if layaCanStart {
                         Button("Start Laya and Try Again") { Task { await folder.startModelAndRetry() } }
                             .buttonStyle(.borderedProminent)
                     } else {
@@ -143,8 +162,15 @@ struct RunView: View {
             } else {
                 Notice(systemImage: "exclamationmark.triangle.fill", tint: .red,
                        text: error.errorDescription ?? "\(error)")
-                Button("Try Again") {
-                    if step == .plan { session.retryPlan(rulesOnly: session.rulesOnly) } else { session.restart() }
+                HStack {
+                    if error.code == "no_access" { PrivacySettingsButton() }
+                    Button("Try Again") {
+                        if step == .plan {
+                            session.retryPlan(rulesOnly: session.rulesOnly)
+                        } else {
+                            folder.scanAgain(rulesOnly: session.rulesOnly)
+                        }
+                    }
                 }
             }
         }
@@ -169,7 +195,10 @@ struct RunView: View {
                     Button("Open Report") { FolderModel.open(plan.report) }
                 }
                 Spacer()
-                Button("Scan Again") { session.restart() }
+                Button("Scan Again") {
+                    if folder.modelStart == .askToInstall { askAboutLaya = true } else { folder.scanAgain() }
+                }
+                .modifier(LayaQuestion(isPresented: $askAboutLaya) { folder.scanAgain(rulesOnly: true) })
                 if case .finished = session.state {
                     Button("Done") { folder.dismissRun() }
                     Button("Review Plan") { folder.openReview() }

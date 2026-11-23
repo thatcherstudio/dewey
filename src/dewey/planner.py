@@ -94,6 +94,14 @@ def decide_all(conn: sqlite3.Connection, decider, items: list, cfg: dict, option
         say(f"Reusing {len(out):,} cached decisions")
     if not todo:
         return out
+    # One real request before the queue goes out, so a server that is down fails here, at once and
+    # in its own words. Only now that something needs deciding: a plan whose files were all decided
+    # before asks the model nothing, and 0.2.1 still failed it when the model wasn't running.
+    ok, msg = dmod.probe(decider, cfg)
+    say(("Decider ok: " if ok else "Decider FAILED: ") + msg)
+    if not ok:
+        raise DeweyExit("Start the decision model server (see README), fix [decider] in dewey.toml, "
+                        "or rerun with --backend none for rules only.", DECIDER)
     prog = Progress("Deciding", total=len(todo))
     errors_in_a_row = 0
     # Not `with ThreadPoolExecutor` (it waits for the whole queue on Ctrl-C). On any exit, queued
@@ -235,12 +243,6 @@ def plan(conn: sqlite3.Connection, root: Path, cfg: dict, decider, state_dir: Pa
 
     # 3. decision model ----------------------------------------------------------
     options = {k: v["desc"] for k, v in cats.items()}
-    if queue and decider.kind != "none":
-        ok, msg = dmod.probe(decider, cfg)
-        say(("Decider ok: " if ok else "Decider FAILED: ") + msg)
-        if not ok:
-            raise DeweyExit("Start the decision model server (see README), fix [decider] in dewey.toml, "
-                            "or rerun with --backend none for rules only.", DECIDER)
     auto_c, rev_c = float(p["auto_confidence"]), float(p["review_confidence"])
     if decider.kind == "none":
         counts["no_rule_matched"] = len(queue)

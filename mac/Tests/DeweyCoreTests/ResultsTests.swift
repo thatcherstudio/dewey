@@ -109,6 +109,30 @@ struct ResultsTests {
         #expect(!source("http://127.0.0.1:8000", "none").isAppLaya)
     }
 
+    /// Before the scan, not after it: start a Laya that is installed, ask about one that isn't.
+    @Test func whatScanAndPlanDoesAboutTheModelFirst() {
+        let ready = LayaController.Status.ready(.init(loaded: ["english"], device: "mps"))
+        func start(_ source: ModelSource?, _ laya: LayaController.Status, running: Bool = false, local: Bool = true,
+                   installed: Bool?) -> ModelStart {
+            ModelStart(source: source, laya: laya, layaRunning: running, layaIsLocal: local, installed: installed)
+        }
+        // the app's Laya, not running
+        #expect(start(.appLaya, .stopped, installed: true) == .startLaya)
+        #expect(start(.appLaya, .failed("exit 1"), installed: true) == .startLaya)
+        #expect(start(.appLaya, .stopped, installed: false) == .askToInstall)
+        #expect(start(nil, .unknown, installed: false) == .askToInstall)  // status not read yet: Laya is the default
+        #expect(start(.appLaya, .stopped, installed: nil) == .nothing)    // still being looked for: don't say it's missing
+        // nothing to do: it answers, or it is loading
+        #expect(start(.appLaya, ready, installed: true) == .nothing)
+        #expect(start(.appLaya, ready, installed: false) == .nothing)     // one started in Terminal answers
+        #expect(start(.appLaya, .starting(since: .now), running: true, installed: true) == .nothing)
+        // not the app's to start: a Laya on another machine, or a folder that asks something else
+        #expect(start(.appLaya, .failed("not answering"), local: false, installed: false) == .nothing)
+        #expect(start(.otherLaya("192.168.1.20:8000"), .stopped, installed: false) == .nothing)
+        #expect(start(.chat("127.0.0.1:8080"), .stopped, installed: false) == .nothing)
+        #expect(start(.rulesOnly, .stopped, installed: false) == .nothing)
+    }
+
     @Test func anInterruptedPlanHasAnEmptySummary() throws {
         let data = Data(#"{"id": 3, "created": "2026-11-17T20:56:32-05:00", "decider": "systemone:english", "csv": null, "report": null, "summary": {}}"#.utf8)
         let p = try DeweyEvent.decoder().decode(FolderStatus.Plan.self, from: data)

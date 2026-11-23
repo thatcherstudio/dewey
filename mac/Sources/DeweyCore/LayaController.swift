@@ -34,6 +34,9 @@ struct ServerRecord: Codable, Equatable, Sendable {
 /// runs means "still loading". A server that was already running on the port is used as is and never
 /// stopped by the app, because the app didn't start it. The one exception is a server an earlier
 /// Dewey started and left behind: `stopLeftover()` ends that one at launch.
+///
+/// The server is started on this Mac, on the port of `baseURL`, so it is started only when
+/// `baseURL` names this Mac. A Laya on another machine is watched, never started.
 @MainActor @Observable
 public final class LayaController {
     public struct Health: Equatable, Sendable {
@@ -62,47 +65,90 @@ public final class LayaController {
     public private(set) var log: [String] = []
     /// The laya-serve this app is running, while it runs.
     public private(set) var executable: URL?
-    public var baseURL: URL
+    /// Where Laya is. An address on this Mac that gives no port ("http://localhost") means
+    /// laya-serve's own, 8000, and reads back with it: the server is started on that port and looked
+    /// for on that port. (0.2.1 started it on 8000 and then asked port 80, with no end.)
+    public var baseURL: URL {
+        get { address }
+        set { address = Self.withPort(newValue) }
+    }
     public var model: String
 
+    private var address: URL
     private var process: Process?
     private var stopping = false
     private var pollTask: Task<Void, Never>?
+    private var starting: Task<Void, Never>?
     private var leftoverNote: String?
     /// Where the running server is written down (`ServerRecord`); nil keeps no record.
     @ObservationIgnored private let record: URL?
+    /// Seconds a laya-serve this app started may load before "starting" becomes a failure with a reason.
+    @ObservationIgnored private let startupLimit: TimeInterval
 
-    public init(baseURL: URL = URL(string: "http://127.0.0.1:8000")!, model: String = "english", record: URL? = nil) {
-        self.baseURL = baseURL
+    /// The port laya-serve listens on when it isn't told another.
+    public static let defaultPort = 8000
+
+    public init(baseURL: URL = URL(string: "http://127.0.0.1:8000")!, model: String = "english", record: URL? = nil,
+                startupLimit: TimeInterval = 600) {
+        self.address = Self.withPort(baseURL)
         self.model = model
         self.record = record
+        self.startupLimit = startupLimit
     }
 
     public var isRunning: Bool { process != nil }
 
-    public var port: Int { baseURL.port ?? 8000 }
+    public var port: Int { baseURL.port ?? Self.defaultPort }
+
+    /// `baseURL` names this Mac, so this app can start the server it names.
+    public var isLocal: Bool { ThisMac.isNamed(by: baseURL.host(percentEncoded: false) ?? "") }
+
+    static func withPort(_ url: URL) -> URL {
+        guard url.port == nil, ThisMac.isNamed(by: url.host(percentEncoded: false) ?? ""),
+              var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        parts.port = defaultPort
+        return parts.url ?? url
+    }
 
     /// Look at the port without starting anything.
     public func refresh() async {
         guard process == nil else { return }
-        switch await Self.probe(baseURL) {
+        let probe = await Self.probe(baseURL)
+        switch probe {
         case .ok(let h): status = .ready(h)
+        case _ where !isLocal: status = .failed(elsewhere(probe))
         case .refused: status = .stopped
         case .other(let why): status = .failed(portTaken(why))
         }
     }
 
+    /// Start laya-serve, unless one already answers. Returns once it is launched (status `.starting`)
+    /// or known not to be. A second call while the first is still on its way waits for that one:
+    /// two of them side by side each found nothing running and each started a server.
     public func start(executable: URL) async {
+        if let starting { return await starting.value }
+        let task = Task { await self.launch(executable) }
+        starting = task
+        await task.value
+        starting = nil
+    }
+
+    private func launch(_ executable: URL) async {
         guard process == nil else { return }
-        switch await Self.probe(baseURL) {
-        case .ok(let h):
+        let probe = await Self.probe(baseURL)
+        if case .ok(let h) = probe {
             status = .ready(h)  // already running (a terminal tab, an earlier launch): use it, don't own it
             return
-        case .other(let why):
+        }
+        guard isLocal else {
+            // Another machine. A server started here would listen on this Mac, where nothing asks:
+            // 0.2.1 started one anyway, loaded the model, and waited for the other address for good.
+            status = .failed(elsewhere(probe))
+            return
+        }
+        if case .other(let why) = probe {
             status = .failed(portTaken(why))
             return
-        case .refused:
-            break
         }
         let p = Process()
         p.executableURL = executable
@@ -223,14 +269,31 @@ public final class LayaController {
         (try? Data(contentsOf: record)).flatMap { try? JSONDecoder().decode(ServerRecord.self, from: $0) }
     }
 
+    /// Ask `/health` once a second until the server answers. After `startupLimit` without an answer,
+    /// "starting" becomes a failure that says so, instead of a spinner with no end. The server isn't
+    /// stopped and the asking goes on: a first start that downloads the model can take longer, and
+    /// then turns ready by itself.
     private func pollUntilReady() async {
+        let began = Date()
+        var saidSo = false
         while !Task.isCancelled, process != nil {
             if case .ok(let h) = await Self.probe(baseURL) {
                 if process != nil { status = .ready(h) }
                 return
             }
+            if !saidSo, process != nil, Date().timeIntervalSince(began) >= startupLimit {
+                saidSo = true
+                status = .failed(Self.stillLoading(after: startupLimit, at: baseURL))
+            }
             try? await Task.sleep(for: .seconds(1))
         }
+    }
+
+    static func stillLoading(after seconds: TimeInterval, at url: URL) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        let waited = minutes >= 1 ? "\(minutes) \(minutes == 1 ? "minute" : "minutes")" : "\(Int(seconds)) seconds"
+        return "laya-serve has been running for \(waited) and still doesn't answer at \(url.absoluteString). "
+            + "Its log may say why. Dewey keeps asking; Stop ends it."
     }
 
     private func append(_ line: String) {
@@ -255,6 +318,14 @@ public final class LayaController {
 
     private func portTaken(_ why: String) -> String {
         "Port \(port) answers, but not like laya-serve (\(why)). Stop whatever uses it, or change the Laya URL in Settings."
+    }
+
+    /// The Laya URL names another machine, and nothing there answers like laya-serve.
+    private func elsewhere(_ probe: Probe) -> String {
+        var why = ""
+        if case .other(let said) = probe { why = " (\(said))" }
+        return "Laya at \(ModelSource.place(baseURL.absoluteString)) isn't answering\(why). That address isn't this Mac, "
+            + "so Dewey can't start Laya there. Start it on that machine, or change the Laya URL in Dewey > Settings."
     }
 
     // MARK: - health

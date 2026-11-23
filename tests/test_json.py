@@ -28,7 +28,7 @@ from test_e2e import SystemOne, build_mess, read_plan, run, serve, snapshot, wri
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
-from dewey import catalog, cli, config, mover, progress  # noqa: E402
+from dewey import catalog, cli, config, mover, planner, progress  # noqa: E402
 
 TERMINAL = {"result", "error", "interrupted"}
 
@@ -385,6 +385,33 @@ class JsonInterface(unittest.TestCase):
         self.assertGreater(cached, 0)
         _, events, _ = run_json("plan", self.R, "--url", self.url)
         self.assertIn(f"Reusing {cached:,} cached decisions", [e.get("text") for e in events])
+
+    def test_a_stop_that_comes_out_as_another_error_is_still_a_stop(self):
+        """Ctrl-C lands wherever the main thread is. Inside one of Python's own locks (the thread pool
+        taking the plan's questions) it comes out as "RuntimeError: release unlocked lock", raised
+        while the KeyboardInterrupt is handled. 0.2.1 answered with an internal error and exit 1,
+        which `test_real_sigint_to_a_subprocess` met about one run in ten."""
+        def stopped_inside_a_lock(*a, **kw):
+            try:
+                raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                raise RuntimeError("release unlocked lock")
+
+        run("scan", self.R)
+        with mock.patch.object(planner, "decide_all", side_effect=stopped_inside_a_lock):
+            code, events, err = run_json("plan", self.R, "--url", self.url)
+        self.assertEqual((code, self.final(events)["event"]), (130, "interrupted"), err)
+        self.assertNotIn("Traceback", err)
+        with mock.patch.object(planner, "decide_all", side_effect=stopped_inside_a_lock), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as said, \
+             self.assertRaises(SystemExit) as cm:
+            cli.main(["plan", self.R, "--url", self.url])  # in Terminal
+        self.assertEqual(cm.exception.code, 130)
+        self.assertIn("interrupted. Finished work is saved", said.getvalue())
+        # an error that no stop is behind is an error still
+        with mock.patch.object(planner, "decide_all", side_effect=RuntimeError("release unlocked lock")):
+            code, events, err = run_json("plan", self.R, "--url", self.url)
+        self.assertEqual((code, self.final(events)["code"]), (1, "internal"), err)
 
     def test_real_sigint_to_a_subprocess(self):
         for i in range(40):

@@ -404,6 +404,32 @@ def _no_access(e: PermissionError) -> str:
             "If not, look at the folder's permissions: in Finder, Get Info > Sharing & Permissions.")
 
 
+def _stop_under(e: BaseException) -> KeyboardInterrupt | None:
+    """The Ctrl-C (or the app's Cancel) that `e` came out of, when it came out of one.
+
+    A stop lands wherever the main thread happens to be. Inside one of Python's own locks (the
+    thread pool taking a plan's questions is one) it can leave the lock half let go, and what comes
+    out is then "RuntimeError: release unlocked lock", raised while the KeyboardInterrupt was being
+    handled. The person still asked to stop, and dewey stopped as it does for any other: 0.2.1 called
+    it an internal error."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        if isinstance(e, KeyboardInterrupt):
+            return e
+        seen.add(id(e))
+        e = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
+    return None
+
+
+def _stopped(e: KeyboardInterrupt, as_json: bool):
+    if as_json:
+        emit("interrupted", batch=getattr(e, "batch", None),
+             message="Finished work is saved; if files were moving, undo puts back the ones that moved.")
+    else:
+        say("\ninterrupted. Finished work is saved; if files were moving, `dewey undo ROOT` puts back the ones that moved.")
+    raise SystemExit(130)
+
+
 def main(argv=None):
     """The `dewey` command. With no argv it is the program itself (not a test calling main([...])),
     so an exit that leaves worker threads behind doesn't wait for them."""
@@ -427,14 +453,14 @@ def _main(argv=None):
         try:
             data = args.fn(args)
         except KeyboardInterrupt as e:
-            if as_json:
-                emit("interrupted", batch=getattr(e, "batch", None),
-                     message="Finished work is saved; if files were moving, undo puts back the ones that moved.")
-            else:
-                say("\ninterrupted. Finished work is saved; if files were moving, `dewey undo ROOT` puts back the ones that moved.")
-            raise SystemExit(130)
+            _stopped(e, as_json)
         except PermissionError as e:  # one file a move can't touch is that row's problem; this is the folder's
             raise DeweyExit(_no_access(e), NO_ACCESS) from None
+        except Exception as e:  # noqa: BLE001 - only to ask whether it is a stop in another error's clothes
+            stop = _stop_under(e)
+            if stop is None:
+                raise
+            _stopped(stop, as_json)
         if as_json:
             emit("result", data=data if data is not None else {})
     except SystemExit as e:
